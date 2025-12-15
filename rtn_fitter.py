@@ -1,12 +1,13 @@
 # Using bias stack, locate pixels with RTN and fit their parameters.
 # Chris Layden
 
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from astropy import units as u
 from scipy.optimize import curve_fit
-from scipy.stats import anderson, norm
+from scipy.stats import norm
 import copy
 import time
 
@@ -44,8 +45,6 @@ def get_read_noise_stats(data, adu_unit, plot=False):
         raise ValueError("At least ten bias images required to compute per-pixel read noise.")
     # data initially has units of ADU
     data = data * adu_unit
-    if gain is not None:
-        data = data.to(u.electron)
     read_var_array = np.nanvar(data, axis=0, ddof=1)
     read_noise_array = np.sqrt(read_var_array)
     mean_read_noise = np.nanmean(read_noise_array)
@@ -243,6 +242,19 @@ if __name__ == "__main__":
     t4 = time.time()
     print(f"Fit RTN parameters in {t4 - t3:.2f} seconds.")
     print(f"Identified {len(rtn_params)} correctable RTN pixels.")
+    # Save rtn_params to a fits file, including the mask. Should have shape (6, nx, ny).
+    # Any pixels without correctable RTN get NaNs.
+    nx, ny = bias_stack.shape[1], bias_stack.shape[2]
+    rtn_params_array = np.full((5, nx, ny), np.nan)
+    for (ix, iy), params in rtn_params.items():
+        rtn_params_array[0, ix, iy] = params[0].to(adu).value  # mu
+        rtn_params_array[1, ix, iy] = params[1]                 # A
+        rtn_params_array[2, ix, iy] = params[2]                 # B
+        rtn_params_array[3, ix, iy] = params[3].to(adu).value  # d
+        rtn_params_array[4, ix, iy] = params[4].to(adu).value  # sigma
+    hdu = fits.PrimaryHDU(rtn_params_array)
+    hdu.writeto('rtn_params.fits', overwrite=True)
+    print(f"Saved RTN parameters to rtn_params.fits")
     plot_naive_corrected(bias_stack, rtn_params, adu)
     # Look at pixels not in rtn_mask but with read noise above 2 e-
     # read_noise_array = np.sqrt(np.nanvar(bias_stack, axis=0, ddof=1)) * adu
