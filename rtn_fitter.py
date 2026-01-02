@@ -120,8 +120,8 @@ def identify_nonnormal_pixels(data, adu_unit, threshold=1.092, plot=False):
 def rtn_triple_gaussian(x, mu, A, B1, B2, d, sigma):
     # Model RTN pixel histogram as sum of three Gaussians.
     central_gaussian = A * np.exp(- (x - mu) ** 2 / sigma ** 2 / 2)
-    left_gaussian = B1 * np.exp(- (x - d - mu) ** 2 / sigma ** 2 / 2)
-    right_gaussian = B2 * np.exp(- (x + d - mu) ** 2 / sigma ** 2 / 2)
+    left_gaussian = B1 * np.exp(- (x + d - mu) ** 2 / sigma ** 2 / 2)
+    right_gaussian = B2 * np.exp(- (x - d - mu) ** 2 / sigma ** 2 / 2)
     return central_gaussian + left_gaussian + right_gaussian
 
 def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spacing=3):
