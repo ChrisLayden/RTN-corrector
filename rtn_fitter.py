@@ -10,20 +10,28 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 import copy
 import time
+from numba import njit
 
-def sigma_clip(data, sigma=10, max_iters=5):
+def sigma_clip(data, sigma=10, max_iters=5, clip_val='mean'):
     # Sigma-clip data along axis 0 (time axis) to remove outliers.
     # Set clipped points to np.nan
     clipped_data = copy.deepcopy(data)
+    std = np.inf
     for _ in range(max_iters):
-        mean = np.mean(clipped_data, axis=0)
-        std = np.std(clipped_data, axis=0, ddof=1)
+        mean = np.nanmean(clipped_data, axis=0)
+        std2 = np.nanstd(clipped_data, axis=0, ddof=1)
+        if np.all(std2 == std):
+            break
+        std = std2
         diff = np.abs(clipped_data - mean)
         mask = diff < (sigma * std)
         if np.all(mask):
             break
-        # set outliers to mean
-        clipped_data = np.where(mask, clipped_data, np.nan)
+        if clip_val == 'mean':
+            # set outliers to mean
+            clipped_data = np.where(mask, clipped_data, mean)
+        else:
+            clipped_data = np.where(mask, clipped_data, np.nan)
     return clipped_data
 
 def get_read_noise_stats(data, adu_unit, plot=False):
@@ -56,9 +64,12 @@ def get_read_noise_stats(data, adu_unit, plot=False):
                         "rms_read_noise": rms_read_noise,
                         "read_noise_sigma": read_noise_sigma}
     if plot:
+        plt.rcParams.update({'font.size': 14})
         plt.hist(read_noise_array.flatten(), bins=200, histtype='step', alpha=0.7)
-        plt.xlabel("Read Noise (e-)" if gain is not None else "Read Noise (ADU)")
+        plt.xlabel("Read Noise (e-)" if adu_unit is not None else "Read Noise (ADU)")
         plt.ylabel("Number of Pixels")
+        # Set x upper limit to 10. Leave lower limit unbound
+        # plt.xlim(right=10)
         plt.yscale('log')
         plt.axvline(mean_read_noise.value, color='red', linestyle='dashed', linewidth=1, label=f"Mean: {mean_read_noise:.2f}")
         plt.axvline(median_read_noise.value, color='blue', linestyle='dashed', linewidth=1, label=f"Median: {median_read_noise:.2f}")
@@ -77,7 +88,10 @@ def ad_statistics_normal(data):
     # Compute Anderson-Darling statistic for normality test for all pixels.
     # Change things to cupy/other GPU libraries later for speed.
     n, nx, ny = data.shape
-    sorted_data = np.sort(data, axis=0)
+    # Sigma clip and smooth data
+    clipped_data = sigma_clip(data, sigma=5, max_iters=3)
+    smoothed_data = smooth_data(clipped_data)
+    sorted_data = np.sort(smoothed_data, axis=0)
     # Normalize to z-scores at each pixel
     mean = np.mean(sorted_data, axis=0, keepdims=True)
     std = np.std(sorted_data, axis=0, ddof=1, keepdims=True)
@@ -117,14 +131,40 @@ def identify_nonnormal_pixels(data, adu_unit, threshold=1.092, plot=False):
         plt.show()
     return nonnormal_mask
 
+@njit
 def rtn_triple_gaussian(x, mu, A, B1, B2, d, sigma):
-    # Model RTN pixel histogram as sum of three Gaussians.
-    central_gaussian = A * np.exp(- (x - mu) ** 2 / sigma ** 2 / 2)
-    left_gaussian = B1 * np.exp(- (x + d - mu) ** 2 / sigma ** 2 / 2)
-    right_gaussian = B2 * np.exp(- (x - d - mu) ** 2 / sigma ** 2 / 2)
-    return central_gaussian + left_gaussian + right_gaussian
+    s2 = sigma ** 2
+    z_c = x - mu
+    z_l = x + d - mu
+    z_r = x - d - mu
+    return (A * np.exp(-z_c**2 / (2 * s2)) + 
+            B1 * np.exp(-z_l**2 / (2 * s2)) + 
+            B2 * np.exp(-z_r**2 / (2 * s2)))
 
-def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spacing=3):
+@njit
+def rtn_triple_gaussian_jac(x, mu, A, B1, B2, d, sigma):
+    s2 = sigma ** 2
+    s3 = sigma ** 3
+    
+    z_c = x - mu
+    z_l = x + d - mu
+    z_r = x - d - mu
+    
+    exp_c = np.exp(-z_c**2 / (2 * s2))
+    exp_l = np.exp(-z_l**2 / (2 * s2))
+    exp_r = np.exp(-z_r**2 / (2 * s2))
+    
+    n = len(x)
+    jac = np.empty((n, 6))
+    jac[:, 0] = (A * exp_c * z_c + B1 * exp_l * z_l + B2 * exp_r * z_r) / s2
+    jac[:, 1] = exp_c
+    jac[:, 2] = exp_l
+    jac[:, 3] = exp_r
+    jac[:, 4] = (-B1 * exp_l * z_l + B2 * exp_r * z_r) / s2
+    jac[:, 5] = (A * exp_c * z_c**2 + B1 * exp_l * z_l**2 + B2 * exp_r * z_r**2) / s3
+    return jac
+
+def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spacing=3, verbose=False):
     """ Identify pixels that have correctable RTN and return their parameters.
 
     Parameters:
@@ -140,6 +180,8 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
     min_spacing : float, optional
         Minimum spacing between central and side peaks that can be corrected,
         in multiples of the noise at 1 e-/frame. Default is 3.
+    verbose : bool, optional
+        If True, print fit diagnostics. Default is False.
     
     Returns:
     --------
@@ -154,26 +196,41 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
     too_close_count = 0
     fit_fail_count = 0
     n_images, nx, ny = data.shape
+    # t0 = time.time()
+    # hist_time = time.time()
+    # fit_time = time.time()
     for ix in range(nx):
+        if verbose:
+            print(f"Fitting column {ix+1}/{nx}")
         for iy in range(ny):
             if not nonnormal_mask[ix, iy]:
                 continue
+            # if time.time() - t0 > 1e-6:
+            #     print("Hist Time:", hist_time - t0, "Fit Time:", fit_time - hist_time)
+            # t0 = time.time()
             pixel_data = data[:, ix, iy]
             # Create histogram
-            counts, bin_edges = np.histogram(pixel_data, bins=50, density=True)
+            bins_min = np.round(np.percentile(pixel_data, 0.5) - adu_unit.to(u.electron).value).astype(int)
+            bins_max = np.round(np.percentile(pixel_data, 99.5) + adu_unit.to(u.electron).value).astype(int)
+            bin_size = np.round(np.max([1, (bins_max - bins_min) / 30])).astype(int)
+            bins = np.arange(bins_min, bins_max + bin_size, bin_size)
+            counts, bin_edges = np.histogram(pixel_data, bins=bins, density=True)
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            # hist_time = time.time()
             # Initial parameter guesses
             mu_guess = np.mean(pixel_data)
             sigma_guess = read_noise_stats['median_read_noise'].to(adu_unit).value
             A_guess = np.max(counts)
             B1_guess = 0.1 * A_guess
             B2_guess = 0.1 * A_guess
-            d_guess = (10 * u.electron).to(adu_unit).value  # Initial guess of 10 e- spacing
+            d_guess = (bins_max - bins_min) / 2
             p0 = [mu_guess, A_guess, B1_guess, B2_guess, d_guess, sigma_guess]
-            bounds = ([0, 0, 0, 0, 0, 0], [np.inf, np.inf, A_guess, A_guess, np.inf, np.inf])
+            d_max = (bins_max - bins_min)
+            bounds = ([0, A_guess / 2, 0, 0, 0, 0], [np.inf, np.inf, A_guess, A_guess, d_max, np.inf])
             try:
                 popt, pcov = curve_fit(rtn_triple_gaussian, bin_centers, counts, p0=p0,
-                                       maxfev=1000, bounds=bounds, full_output=False)
+                                       maxfev=100, bounds=bounds, full_output=False,
+                                       jac=rtn_triple_gaussian_jac)
                 mu_fit = popt[0]
                 A_fit = popt[1] / (popt[1] + popt[2] + popt[3])  # Normalize A
                 B_fit = popt[3] / (popt[1] + popt[2] + popt[3])  # Normalize B1
@@ -181,7 +238,9 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
                 sigma_fit = popt[5]
                 # Check uncertainty: skip if uncertainty in any parameter is more than 30%
                 errs = np.sqrt(np.diag(pcov))
-                if np.any(popt / errs < 3):
+                # Check if spacing is sufficient for correction when photon flux is 1 e-/frame
+                noise_at_1e = np.sqrt(sigma_fit ** 2 + (1 * u.electron).to(adu_unit).value ** 2)
+                if np.any(popt / errs < 3) or B_fit > A_fit:
                     poor_fit_count += 1
                     # print(mu_fit, A_fit, B_fit, d_fit / 42, sigma_fit / 42, np.std(pixel_data) / 42)
                     # plt.hist(pixel_data, bins=50, density=True, alpha=0.6, label='Data Histogram')
@@ -189,21 +248,28 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
                     # y_fit = rtn_triple_gaussian(x_fit, *popt)
                     # plt.plot(x_fit, y_fit, 'r-', label='Fit')
                     # plt.show()
-                # Check if spacing is sufficient for correction when photon flux is 1 e-/frame
-                noise_at_1e = np.sqrt(sigma_fit ** 2 + (1 * u.electron).to(adu_unit).value ** 2)
-                if (d_fit >= min_spacing * noise_at_1e) and A_fit < 0.95:
+                elif (d_fit >= min_spacing * noise_at_1e) and A_fit < 0.95:
                     rtn_params[(ix, iy)] = (mu_fit * adu_unit, A_fit, B_fit, d_fit * adu_unit, sigma_fit * adu_unit)
                     rtn_mask[ix, iy] = True
-                    # print(mu_fit, A_fit, B_fit, (d_fit * adu_unit).to(u.electron), (sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
-                    # plt.hist(pixel_data, bins=50, density=True, alpha=0.6, label='Data Histogram')
+                    # print(mu_guess, A_guess, B1_guess, d_guess, sigma_guess)
+                    # print(mu_fit, popt[1], popt[2], d_fit, sigma_fit)
+                    # plt.hist(pixel_data, bins=bins, density=True, alpha=0.6, label='Data Histogram')
                     # x_fit = np.linspace(np.min(bin_centers), np.max(bin_centers), 200)
                     # y_fit = rtn_triple_gaussian(x_fit, *popt)
                     # plt.plot(x_fit, y_fit, 'r-', label='Fit')
                     # plt.show()
                 else:
                     too_close_count += 1
+                    # print(mu_fit, A_fit, B_fit, (d_fit * adu_unit).to(u.electron), (sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
+                    # plt.hist(pixel_data, bins=bins, density=True, alpha=0.6, label='Data Histogram')
+                    # x_fit = np.linspace(np.min(bin_centers), np.max(bin_centers), 200)
+                    # y_fit = rtn_triple_gaussian(x_fit, *popt)
+                    # plt.plot(x_fit, y_fit, 'r-', label='Fit')
+                    # plt.show()
+                # fit_time = time.time()
             except RuntimeError:
                 fit_fail_count += 1
+                # fit_time = time.time()
                 # Fit did not converge; skip this pixel
                 continue
     return rtn_params, rtn_mask
@@ -280,6 +346,7 @@ def plot_snr_ratio(lambda_max_arr, old_stats, new_stats):
     plt.grid(axis='y')
     plt.xscale('log')
     plt.show()
+    return flux_values, snr_values_corr / snr_values_old
 
 def plot_naive_corrected(data, rtn_params, adu_unit):
     # Plot histogram of read noise before correction and the best possible correction.
@@ -301,6 +368,7 @@ def plot_naive_corrected(data, rtn_params, adu_unit):
 if __name__ == "__main__":
     t0 = time.time()
     bias_stack_file = 'bias_stack_subset.fits'
+    # gain = 8.9
     gain = 42  # ADU/e-
     bias_stack = fits.open(bias_stack_file)[0].data.astype(np.int32)
     t1 = time.time()
@@ -312,9 +380,11 @@ if __name__ == "__main__":
     t2 = time.time()
     print(f"Computed read noise stats in {t2 - t1:.2f} seconds.")
     nonnormal_mask = identify_nonnormal_pixels(bias_stack, adu, plot=True)
+    nonnormal_pix = np.sum(nonnormal_mask)
+    print(f"Identified {nonnormal_pix} non-normal pixels.")
     t3 = time.time()
     print(f"Identified non-normal pixels in {t3 - t2:.2f} seconds.")
-    rtn_params, rtn_mask = fit_rtn_parameters(bias_stack, nonnormal_mask, read_noise_stats, adu, min_spacing=3)
+    rtn_params, rtn_mask = fit_rtn_parameters(bias_stack, nonnormal_mask, read_noise_stats, adu, min_spacing=3, verbose=True)
     t4 = time.time()
     print(f"Fit RTN parameters in {t4 - t3:.2f} seconds.")
     print(f"Identified {len(rtn_params)} correctable RTN pixels.")

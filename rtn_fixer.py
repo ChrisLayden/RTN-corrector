@@ -31,7 +31,7 @@ def get_diff_stack(image_stack, smoothed_stack, window_size=10):
         diff_stack[i] = diff
     return diff_stack
 
-def correct_signal_vals(diff_stack, image_stack, smoothed_stack, rtn_params, adu_unit, threshold=3, window_size=10):
+def correct_signal_vals(diff_stack, image_stack, smoothed_stack, rtn_params, adu_unit, threshold=3, verbose=False):
     corrected_vals = image_stack.copy()
     rtn_mask = ~np.isnan(rtn_params[0])
     rtn_jumps = diff_stack * rtn_mask
