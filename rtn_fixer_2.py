@@ -3,7 +3,7 @@
 Apply RTN correction to a stack of frames.
 
 Usage:
-    python correct_rtn.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -w 10 -t 3
+    python correct_rtn.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -w 10
 """
 
 import argparse
@@ -13,10 +13,61 @@ import numpy as np
 from numba import njit
 from astropy.io import fits
 
+def load_lut(filename):
+    data = np.load(filename)
+    return (data['lam'], data['rn'], data['dx'],
+            data['ll'], data['lh'], data['hl'], data['hh'])
+
+
+@njit
+def lookup_thresholds(lam, rn, dx, lam_vals, rn_vals, dx_vals,
+                      grid_ll, grid_lh, grid_hl, grid_hh):
+    """
+    Numba-compatible trilinear interpolation for all four thresholds.
+    
+    Returns (low_lo, low_hi, high_lo, high_hi).
+    Returns NaNs if peaks blend (high_lo > lam + dx).
+    """
+    i = np.searchsorted(lam_vals, lam) - 1
+    j = np.searchsorted(rn_vals, rn) - 1
+    k = np.searchsorted(dx_vals, dx) - 1
+    
+    i = max(0, min(i, len(lam_vals) - 2))
+    j = max(0, min(j, len(rn_vals) - 2))
+    k = max(0, min(k, len(dx_vals) - 2))
+    
+    t = (lam - lam_vals[i]) / (lam_vals[i+1] - lam_vals[i])
+    u = (rn - rn_vals[j]) / (rn_vals[j+1] - rn_vals[j])
+    v = (dx - dx_vals[k]) / (dx_vals[k+1] - dx_vals[k])
+    
+    w000 = (1-t) * (1-u) * (1-v)
+    w001 = (1-t) * (1-u) * v
+    w010 = (1-t) * u * (1-v)
+    w011 = (1-t) * u * v
+    w100 = t * (1-u) * (1-v)
+    w101 = t * (1-u) * v
+    w110 = t * u * (1-v)
+    w111 = t * u * v
+    
+    def interp(grid):
+        return (w000 * grid[i, j, k] + w001 * grid[i, j, k+1] +
+                w010 * grid[i, j+1, k] + w011 * grid[i, j+1, k+1] +
+                w100 * grid[i+1, j, k] + w101 * grid[i+1, j, k+1] +
+                w110 * grid[i+1, j+1, k] + w111 * grid[i+1, j+1, k+1])
+    
+    high_lo = interp(grid_hl)
+    
+    # Peaks blend if lower bound of high peak exceeds its center
+    if high_lo > lam + dx:
+        return np.nan, np.nan, np.nan, np.nan
+    
+    return interp(grid_ll), interp(grid_lh), high_lo, interp(grid_hh)
+
+lut_lam, lut_rn, lut_dx, lut_ll, lut_lh, lut_hl, lut_hh = load_lut('rts_lut.npz')
 
 @njit
 def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e, 
-                   read_noise_e, lambda_max_arr, e_per_adu, threshold, num_corr_arr):
+                   read_noise_e, e_per_adu, num_corr_arr):
     ny, nx = frame.shape
     corrected = frame.copy()
     num_corr = 0
@@ -30,16 +81,21 @@ def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e,
             lam = rolling_mean[y, x] * e_per_adu - mu_e[y, x]
             if lam < 0:
                 lam = 0
-            elif lam > lambda_max_arr[y, x]:
+            noise = np.sqrt(lam + read_noise_e[y, x]**2)
+            delta = delta_x_arr_e[y, x]
+            low_lo, low_hi, high_lo, high_hi = lookup_thresholds(
+                lam, read_noise_e[y, x], delta,
+                lut_lam, lut_rn, lut_dx,
+                lut_ll, lut_lh, lut_hl, lut_hh
+            )
+            if np.isnan(low_lo):
                 num_skipped += 1
                 continue
-            noise = np.sqrt(lam + read_noise_e[y, x]**2)
-            thr_noise = threshold * noise
-            delta = delta_x_arr_e[y, x]
-            high_lo = max(delta - thr_noise, thr_noise)
-            high_hi = delta + thr_noise
-            low_lo = -delta - thr_noise
-            low_hi = min(-delta + thr_noise, -thr_noise)
+            # print(high_lo, max(delta - thr_noise, thr_noise), lam, read_noise_e[y, x], delta)
+            # high_lo = max(lam + delta - thr_noise, lam + thr_noise)
+            # high_hi = lam + delta + thr_noise
+            # low_lo = lam - delta - thr_noise
+            # low_hi = min(lam - delta + thr_noise, lam - thr_noise)
 
             corr = 0.0
             diff = (frame[y, x] - rolling_mean[y, x]) * e_per_adu
@@ -82,8 +138,6 @@ def main():
                         help='Output folder (default: ./corrected/)')
     parser.add_argument('-w', '--window', type=int, default=10,
                         help='Rolling window size (default: 10)')
-    parser.add_argument('-t', '--threshold', type=float, default=3.0,
-                        help='Detection threshold in sigma (default: 3.0)')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -97,14 +151,6 @@ def main():
     e_per_adu = 1.0 / args.gain
     rtn_mask = ~np.isnan(rtn_params[0])
     print(np.sum(rtn_mask), "RTN pixels detected.")
-    # Make lambda_max array
-    lambda_max_arr = (rtn_params[3] / args.threshold / args.gain) ** 2 - (rtn_params[4] / args.gain) ** 2
-    # Given the threshold, set any pixels with lambda_max <= 1 to non-RTN
-    rtn_mask = rtn_mask & (lambda_max_arr > 1)
-    rtn_params = np.where(rtn_mask, rtn_params, np.nan)
-    print(np.sum(rtn_mask), "RTN pixels detected.")
-    lambda_max_arr = np.where(rtn_mask, lambda_max_arr, 0)
-    lambda_max_arr = np.ascontiguousarray(lambda_max_arr)
     delta_x_arr_e = np.ascontiguousarray(rtn_params[3] * e_per_adu)
     mu_e = e_per_adu * ((rtn_params[0] * rtn_params[1]) +
                         (rtn_params[0] - rtn_params[3]) * rtn_params[2] +
@@ -127,8 +173,8 @@ def main():
     dummy = np.zeros((10, 10), dtype=np.float64)
     _ = _correct_frame(dummy, dummy, rtn_mask[:10, :10], 
                        delta_x_arr_e[:10, :10], mu_e[:10, :10],
-                       read_noise_e[:10, :10], lambda_max_arr[:10, :10],
-                       e_per_adu, args.threshold, num_corr_arr[:, :10, :10])
+                       read_noise_e[:10, :10],
+                       e_per_adu, num_corr_arr[:, :10, :10])
 
     out_folder = Path(args.output)
     out_folder.mkdir(parents=True, exist_ok=True)
@@ -160,15 +206,14 @@ def main():
         
         corrected, num_corr_arr = _correct_frame(
             center_frame, rolling_mean, rtn_mask,
-            delta_x_arr_e, mu_e, read_noise_e, lambda_max_arr,
-            e_per_adu, args.threshold, num_corr_arr
+            delta_x_arr_e, mu_e, read_noise_e,
+            e_per_adu, num_corr_arr
         )
 
         # Load header for center frame and save
         _, center_header = load_frame(files[center_idx])
         center_header['RTNCORR'] = True
         center_header['RTNWIN'] = args.window
-        center_header['RTNTHR'] = args.threshold
         
         out_path = out_folder / files[center_idx].name
         fits.writeto(out_path, corrected.astype(np.int16), center_header, overwrite=True)
