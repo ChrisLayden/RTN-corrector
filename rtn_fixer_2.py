@@ -4,6 +4,7 @@ Apply RTN correction to a stack of frames.
 
 Usage:
     python correct_rtn.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -w 10
+    python correct_rtn.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -m 3
 """
 
 import argparse
@@ -11,6 +12,7 @@ from pathlib import Path
 from collections import deque
 import numpy as np
 from numba import njit
+from scipy.ndimage import median_filter
 from astropy.io import fits
 from scripts.make_lut import ThresholdLUT
 
@@ -78,7 +80,7 @@ hl_data = lut.high_peak_low
 hh_data = lut.high_peak_high
 
 @njit
-def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e, 
+def _correct_frame(frame, reference, rtn_mask, delta_x_arr_e, mu_e, 
                    read_noise_e, e_per_adu, num_corr_arr):
     ny, nx = frame.shape
     corrected = frame.copy()
@@ -90,7 +92,7 @@ def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e,
             if not rtn_mask[y, x]:
                 continue
 
-            lam = rolling_mean[y, x] * e_per_adu - mu_e[y, x]
+            lam = reference[y, x] * e_per_adu - mu_e[y, x]
             if lam < 0:
                 lam = 0
             noise = np.sqrt(lam + read_noise_e[y, x]**2)
@@ -103,26 +105,19 @@ def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e,
             if np.isnan(low_lo):
                 num_skipped += 1
                 continue
-            # print(high_lo, max(delta - thr_noise, thr_noise), lam, read_noise_e[y, x], delta)
-            # high_lo = max(lam + delta - thr_noise, lam + thr_noise)
-            # high_hi = lam + delta + thr_noise
-            # low_lo = lam - delta - thr_noise
-            # low_hi = min(lam - delta + thr_noise, lam - thr_noise)
 
             corr = 0.0
-            diff = (frame[y, x] - rolling_mean[y, x]) * e_per_adu
-            # print(diff, high_lo, high_hi, low_lo, low_hi)
-            if diff > high_lo and diff < high_hi:
+            pix_e = frame[y, x] * e_per_adu - mu_e[y, x]
+            if pix_e > high_lo and pix_e < high_hi:
                 num_corr += 1
                 corr = -delta
                 num_corr_arr[1, y, x] += 1
-            elif diff < low_hi and diff > low_lo:
+            elif pix_e < low_hi and pix_e > low_lo:
                 num_corr += 1
                 corr = delta
                 num_corr_arr[0, y, x] += 1
 
             corrected[y, x] = frame[y, x] + round(corr / e_per_adu)
-    # print(num_corr, num_skipped)
     return corrected, num_corr_arr
 
 
@@ -148,8 +143,10 @@ def main():
     parser.add_argument('gain', type=float, help='Sensor gain in ADU/e-')
     parser.add_argument('-o', '--output', default='./corrected/',
                         help='Output folder (default: ./corrected/)')
-    parser.add_argument('-w', '--window', type=int, default=10,
-                        help='Rolling window size (default: 10)')
+    parser.add_argument('-w', '--window', type=int, default=None,
+                        help='Rolling mean window size (temporal)')
+    parser.add_argument('-m', '--median-size', type=int, default=None,
+                        help='Median filter kernel size (spatial)')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -169,15 +166,27 @@ def main():
                         (rtn_params[0] + rtn_params[3]) * (1 - rtn_params[1] - rtn_params[2]))
     mu_e = np.ascontiguousarray(mu_e)
     read_noise_e = np.ascontiguousarray(rtn_params[4] * e_per_adu)
-    num_corr_arr = np.zeros((2, *rtn_mask.shape), dtype=np.int32)  # For statistics
+    num_corr_arr = np.zeros((2, *rtn_mask.shape), dtype=np.int32)
+
+    # Validate reference method arguments
+    if args.window is not None and args.median_size is not None:
+        parser.error("Specify either -w (rolling mean) or -m (median filter), not both")
+    if args.window is None and args.median_size is None:
+        parser.error("Must specify either -w (rolling mean) or -m (median filter)")
+
+    use_rolling_mean = args.window is not None
 
     # Get file list
     files = get_fits_files(args.input_folder)
     n_frames = len(files)
-    half_w = args.window // 2
+    half_w = args.window // 2 if use_rolling_mean else 0
     
     if args.verbose:
         print(f"Found {n_frames} frames")
+        if use_rolling_mean:
+            print(f"Reference method: rolling mean (window={args.window})")
+        else:
+            print(f"Reference method: median filter (size={args.median_size})")
 
     # JIT warmup
     if args.verbose:
@@ -191,57 +200,77 @@ def main():
     out_folder = Path(args.output)
     out_folder.mkdir(parents=True, exist_ok=True)
 
-    # Initialize rolling window buffer
-    window_buffer = deque(maxlen=2 * half_w + 1)
-    rolling_sum = None
+    if use_rolling_mean:
+        # Initialize rolling window buffer
+        window_buffer = deque(maxlen=2 * half_w + 1)
+        rolling_sum = None
 
-    # First pass: fill initial window and process
-    for i in range(n_frames):
-        frame, header = load_frame(files[i])
-        
-        # Add to rolling buffer
-        if rolling_sum is None:
-            rolling_sum = np.zeros_like(frame)
-        
-        if len(window_buffer) == window_buffer.maxlen:
-            rolling_sum -= window_buffer[0]
-        window_buffer.append(frame)
-        rolling_sum += frame
+        for i in range(n_frames):
+            frame, header = load_frame(files[i])
+            
+            if rolling_sum is None:
+                rolling_sum = np.zeros_like(frame)
+            
+            if len(window_buffer) == window_buffer.maxlen:
+                rolling_sum -= window_buffer[0]
+            window_buffer.append(frame)
+            rolling_sum += frame
 
-        # Process frame at center of window
-        center_idx = i - half_w
-        if center_idx < 0 or center_idx >= n_frames - half_w:
-            continue
+            center_idx = i - half_w
+            if center_idx < 0 or center_idx >= n_frames - half_w:
+                continue
 
-        rolling_mean = rolling_sum / len(window_buffer)
-        # rolling_median = np.median(np.array(window_buffer), axis=0)
-        center_frame = window_buffer[half_w]
-        
-        corrected, num_corr_arr = _correct_frame(
-            center_frame, rolling_mean, rtn_mask,
-            delta_x_arr_e, mu_e, read_noise_e,
-            e_per_adu, num_corr_arr
-        )
+            # reference = rolling_sum / len(window_buffer)
+            reference = np.median(window_buffer, axis=0)
+            center_frame = window_buffer[half_w]
+            
+            corrected, num_corr_arr = _correct_frame(
+                center_frame, reference, rtn_mask,
+                delta_x_arr_e, mu_e, read_noise_e,
+                e_per_adu, num_corr_arr
+            )
 
-        # Load header for center frame and save
-        _, center_header = load_frame(files[center_idx])
-        center_header['RTNCORR'] = True
-        center_header['RTNWIN'] = args.window
-        
-        out_path = out_folder / files[center_idx].name
-        fits.writeto(out_path, corrected.astype(np.int16), center_header, overwrite=True)
-        
-        if args.verbose:
-            print(f"Corrected {center_idx + 1}/{n_frames}: {files[center_idx].name}")
+            _, center_header = load_frame(files[center_idx])
+            center_header['RTNCORR'] = True
+            center_header['RTNWIN'] = args.window
+            center_header['RTNREF'] = 'rolling_mean'
+            
+            out_path = out_folder / files[center_idx].name
+            fits.writeto(out_path, corrected.astype(np.int16), center_header, overwrite=True)
+            
+            if args.verbose:
+                print(f"Corrected {center_idx + 1}/{n_frames}: {files[center_idx].name}")
 
-    # Copy edge frames uncorrected
-    for i in list(range(half_w)) + list(range(n_frames - half_w, n_frames)):
-        frame, header = load_frame(files[i])
-        header['RTNCORR'] = False
-        out_path = out_folder / files[i].name
-        fits.writeto(out_path, frame.astype(np.int16), header, overwrite=True)
-        if args.verbose:
-            print(f"Copied (edge) {i + 1}/{n_frames}: {files[i].name}")
+        # Copy edge frames uncorrected
+        for i in list(range(half_w)) + list(range(n_frames - half_w, n_frames)):
+            frame, header = load_frame(files[i])
+            header['RTNCORR'] = False
+            out_path = out_folder / files[i].name
+            fits.writeto(out_path, frame.astype(np.int16), header, overwrite=True)
+            if args.verbose:
+                print(f"Copied (edge) {i + 1}/{n_frames}: {files[i].name}")
+
+    else:  # median_filter
+        for i, fpath in enumerate(files):
+            frame, header = load_frame(fpath)
+            
+            reference = median_filter(frame, size=args.median_size)
+            
+            corrected, num_corr_arr = _correct_frame(
+                frame, reference, rtn_mask,
+                delta_x_arr_e, mu_e, read_noise_e,
+                e_per_adu, num_corr_arr
+            )
+
+            header['RTNCORR'] = True
+            header['RTNREF'] = 'median_filter'
+            header['RTNMEDSZ'] = args.median_size
+            
+            out_path = out_folder / fpath.name
+            fits.writeto(out_path, corrected.astype(np.int16), header, overwrite=True)
+            
+            if args.verbose:
+                print(f"Corrected {i + 1}/{n_frames}: {fpath.name}")
 
     print(f"Done. Processed {n_frames} frames.")
     frac_high_corrections = num_corr_arr[1] / len(files) / (1 - rtn_params[1] - rtn_params[2])
