@@ -17,67 +17,56 @@ from astropy.io import fits
 from scripts.make_lut import ThresholdLUT
 
 @njit
-def interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, data):
-    """Trilinear interpolation on regular grid."""
+def interp2d(lam, rn, lam_vals, rn_vals, data):
+    """Bilinear interpolation on regular grid."""
     # Find indices
     i = np.searchsorted(lam_vals, lam) - 1
     j = np.searchsorted(rn_vals, rn) - 1
-    k = np.searchsorted(dx_vals, dx) - 1
     
     # Clamp to valid range
     i = max(0, min(i, len(lam_vals) - 2))
     j = max(0, min(j, len(rn_vals) - 2))
-    k = max(0, min(k, len(dx_vals) - 2))
     
     # Fractional position within cell
     t = (lam - lam_vals[i]) / (lam_vals[i+1] - lam_vals[i])
     u = (rn - rn_vals[j]) / (rn_vals[j+1] - rn_vals[j])
-    v = (dx - dx_vals[k]) / (dx_vals[k+1] - dx_vals[k])
     
     # Clamp fractions
     t = max(0.0, min(1.0, t))
     u = max(0.0, min(1.0, u))
-    v = max(0.0, min(1.0, v))
     
-    # Trilinear interpolation
-    c000 = data[i, j, k]
-    c001 = data[i, j, k+1]
-    c010 = data[i, j+1, k]
-    c011 = data[i, j+1, k+1]
-    c100 = data[i+1, j, k]
-    c101 = data[i+1, j, k+1]
-    c110 = data[i+1, j+1, k]
-    c111 = data[i+1, j+1, k+1]
+    # Bilinear interpolation
+    c00 = data[i, j]
+    c01 = data[i, j+1]
+    c10 = data[i+1, j]
+    c11 = data[i+1, j+1]
     
-    return (c000 * (1-t) * (1-u) * (1-v) +
-            c001 * (1-t) * (1-u) * v +
-            c010 * (1-t) * u * (1-v) +
-            c011 * (1-t) * u * v +
-            c100 * t * (1-u) * (1-v) +
-            c101 * t * (1-u) * v +
-            c110 * t * u * (1-v) +
-            c111 * t * u * v)
+    return (c00 * (1-t) * (1-u) +
+            c01 * (1-t) * u +
+            c10 * t * (1-u) +
+            c11 * t * u)
 
 
 @njit
-def get_thresholds_numba(lam, rn, dx, lam_vals, rn_vals, dx_vals,
-                         ll_data, lh_data, hl_data, hh_data):
-    """Get all four thresholds."""
-    ll = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, ll_data)
-    lh = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, lh_data)
-    hl = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, hl_data)
-    hh = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, hh_data)
-    return ll, lh, hl, hh
+def get_thresholds_numba(lam, rn, dx, lam_vals, rn_vals,
+                         central_low_data, central_high_data):
+    """Get all four peak thresholds from central thresholds + delta_x shift."""
+    central_low = interp2d(lam, rn, lam_vals, rn_vals, central_low_data)
+    central_high = interp2d(lam, rn, lam_vals, rn_vals, central_high_data)
+    
+    high_peak_high = central_high + dx
+    high_peak_low = max(central_low + dx, central_high)
+    low_peak_low = central_low - dx
+    low_peak_high = min(central_high - dx, central_low)
+    
+    return low_peak_low, low_peak_high, high_peak_low, high_peak_high
 
 # Extract once at setup for numba-compatible interpolation
 lut = ThresholdLUT.load('rts_threshold_lut.pkl')
 lam_vals = lut.lam_vals
 rn_vals = lut.rn_vals
-dx_vals = lut.dx_vals
-ll_data = lut.low_peak_low
-lh_data = lut.low_peak_high
-hl_data = lut.high_peak_low
-hh_data = lut.high_peak_high
+central_low_data = lut.central_low
+central_high_data = lut.central_high
 
 @njit
 def _correct_frame(frame, reference, rtn_mask, delta_x_arr_e, mu_e, 
@@ -99,20 +88,20 @@ def _correct_frame(frame, reference, rtn_mask, delta_x_arr_e, mu_e,
             delta = delta_x_arr_e[y, x]
             low_lo, low_hi, high_lo, high_hi = get_thresholds_numba(
                 lam, read_noise_e[y, x], delta,
-                lam_vals, rn_vals, dx_vals,
-                ll_data, lh_data, hl_data, hh_data
+                lam_vals, rn_vals,
+                central_low_data, central_high_data
             )
             if np.isnan(low_lo):
                 num_skipped += 1
                 continue
 
             corr = 0.0
-            pix_e = frame[y, x] * e_per_adu - mu_e[y, x]
-            if pix_e > high_lo and pix_e < high_hi:
+            diff = (frame[y, x] - reference[y, x]) * e_per_adu
+            if diff > high_lo and diff < high_hi:
                 num_corr += 1
                 corr = -delta
                 num_corr_arr[1, y, x] += 1
-            elif pix_e < low_hi and pix_e > low_lo:
+            elif diff < low_hi and diff > low_lo:
                 num_corr += 1
                 corr = delta
                 num_corr_arr[0, y, x] += 1
