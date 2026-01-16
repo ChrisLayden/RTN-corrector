@@ -11,6 +11,7 @@ from scipy.stats import norm
 import copy
 import time
 from numba import njit
+from scripts.make_lut import ThresholdLUT
 
 def sigma_clip(data, sigma=10, max_iters=5, clip_val='mean'):
     # Sigma-clip data along axis 0 (time axis) to remove outliers.
@@ -191,7 +192,9 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
         such that the right peak amplitude is (1 - A - B).
     """
     rtn_mask = np.zeros(nonnormal_mask.shape, dtype=bool)
-    rtn_params = {}
+    # Store parameters in an array. Will be 6 x nx x ny: mu, A, B, d, sigma, lambda_max (added later)
+    # non-RTN values will be np.nan
+    rtn_params_array = np.full((6, data.shape[1], data.shape[2]), np.nan)
     poor_fit_count = 0
     too_close_count = 0
     fit_fail_count = 0
@@ -233,26 +236,33 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
                                        jac=rtn_triple_gaussian_jac)
                 mu_fit = popt[0]
                 A_fit = popt[1] / (popt[1] + popt[2] + popt[3])  # Normalize A
-                B_fit = popt[3] / (popt[1] + popt[2] + popt[3])  # Normalize B1
+                B_fit = popt[2] / (popt[1] + popt[2] + popt[3])  # Normalize B1
                 d_fit = popt[4]
                 sigma_fit = popt[5]
                 # Check uncertainty: skip if uncertainty in any parameter is more than 30%
                 errs = np.sqrt(np.diag(pcov))
                 # Check if spacing is sufficient for correction when photon flux is 1 e-/frame
-                noise_at_1e = np.sqrt(sigma_fit ** 2 + (1 * u.electron).to(adu_unit).value ** 2)
+                # noise_at_1e = np.sqrt(sigma_fit ** 2 + (1 * u.electron).to(adu_unit).value ** 2)
                 if np.any(popt / errs < 3) or B_fit > A_fit:
                     poor_fit_count += 1
-                    # print(mu_fit, A_fit, B_fit, d_fit / 42, sigma_fit / 42, np.std(pixel_data) / 42)
-                    # plt.hist(pixel_data, bins=50, density=True, alpha=0.6, label='Data Histogram')
+                    # print(popt)
+                    # print(errs)
+                    # plt.hist(pixel_data, bins=bins, density=True, alpha=0.6, label='Data Histogram')
                     # x_fit = np.linspace(np.min(bin_centers), np.max(bin_centers), 200)
                     # y_fit = rtn_triple_gaussian(x_fit, *popt)
                     # plt.plot(x_fit, y_fit, 'r-', label='Fit')
                     # plt.show()
-                elif (d_fit >= min_spacing * noise_at_1e) and A_fit < 0.95:
-                    rtn_params[(ix, iy)] = (mu_fit * adu_unit, A_fit, B_fit, d_fit * adu_unit, sigma_fit * adu_unit)
+                # elif (d_fit >= min_spacing * noise_at_1e) and A_fit < 0.95:
+                elif (d_fit >= 3 * sigma_fit) and A_fit < 0.95:
+                    rtn_params_array[:-1, ix, iy] = [(mu_fit * adu_unit).to(u.electron).value,
+                                                   A_fit, B_fit,
+                                                   (d_fit * adu_unit).to(u.electron).value,
+                                                   (sigma_fit * adu_unit).to(u.electron).value]
                     rtn_mask[ix, iy] = True
                     # print(mu_guess, A_guess, B1_guess, d_guess, sigma_guess)
                     # print(mu_fit, popt[1], popt[2], d_fit, sigma_fit)
+                    # print(popt)
+                    # print(errs)
                     # plt.hist(pixel_data, bins=bins, density=True, alpha=0.6, label='Data Histogram')
                     # x_fit = np.linspace(np.min(bin_centers), np.max(bin_centers), 200)
                     # y_fit = rtn_triple_gaussian(x_fit, *popt)
@@ -260,7 +270,8 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
                     # plt.show()
                 else:
                     too_close_count += 1
-                    # print(mu_fit, A_fit, B_fit, (d_fit * adu_unit).to(u.electron), (sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
+                    # print(popt)
+                    # print(errs)
                     # plt.hist(pixel_data, bins=bins, density=True, alpha=0.6, label='Data Histogram')
                     # x_fit = np.linspace(np.min(bin_centers), np.max(bin_centers), 200)
                     # y_fit = rtn_triple_gaussian(x_fit, *popt)
@@ -272,98 +283,58 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, min_spa
                 # fit_time = time.time()
                 # Fit did not converge; skip this pixel
                 continue
-    return rtn_params, rtn_mask
+    print(poor_fit_count, too_close_count, fit_fail_count)
+    return rtn_params_array, rtn_mask
 
-def get_lambda_max_arr(rtn_params, threshold=3, plot=False):
-    """Calculate the maximum correctable electron flux for each RTN pixel.
-    
-    Parameters:
-    -----------
-    rtn_params : dict
-        Dictionary with keys as (x, y) pixel coordinates and values as fitted RTN parameters:
-        (mu, A, B, d, sigma).
-    threshold : float, optional
-        Threshold in multiples of noise for identifying RTN jumps. Default is 3.
-    plot : bool, optional
-        If True, plot histogram of lambda_max values. Default is False.
-        
-    Returns:
-    --------
-    lambda_max_dict : dict
-        Dictionary with keys as (x, y) pixel coordinates and values as maximum correctable
-        electron flux (lambda_max) in units of e-/frame.
-    """
-    lambda_max_arr = np.zeros(len(rtn_params))
-    for i, ((ix, iy), params) in enumerate(rtn_params.items()):
-        d = params[3].to(u.electron).value
-        sigma = params[4].to(u.electron).value
-        # Solve for lambda_max such that d = threshold * sqrt(sigma^2 + lambda_max)
-        lambda_max = (d / threshold) ** 2 - sigma ** 2
-        lambda_max_arr[i] = max(lambda_max, 0) # Ensure non-negative
+def add_lambda_max(rtn_params_array, lut, plot=False):
+    for ix in range(rtn_params_array.shape[1]):
+        for iy in range(rtn_params_array.shape[2]):
+            if np.isnan(rtn_params_array[0, ix, iy]):
+                continue
+            delta_x = rtn_params_array[3, ix, iy]
+            sigma = rtn_params_array[4, ix, iy]
+            lambda_max = lut.get_lambda_max(read_noise=sigma, delta_x=delta_x)
+            # LUT only goes up to 100 e-
+            if lambda_max == np.inf:
+                lambda_max = 100.0
+            rtn_params_array[5, ix, iy] = lambda_max
     if plot:
         plt.rcParams.update({'font.size': 14})
-        plt.hist(lambda_max_arr, bins=100, histtype='step', alpha=0.7)
-        plt.xlabel("Maximum Correctable Electron Flux (e-/pix/frame)")
-        median_lambda_max = np.median(lambda_max_arr)
-        plt.axvline(median_lambda_max, color='red', linestyle='dashed', linewidth=1, label=f"Median: {median_lambda_max:.2f} e-/pix/frame")
+        plt.hist(rtn_params_array[5, ~np.isnan(rtn_params_array[0])].flatten(), bins=200, histtype='step', alpha=0.7)
+        # Plot vertical line at median lambda max
+        median_lambda_max = np.median(rtn_params_array[5, ~np.isnan(rtn_params_array[0])])
+        plt.axvline(median_lambda_max, color='red', linestyle='dashed', linewidth=1, label=r"Median $\lambda_{max}$" + f": {median_lambda_max:.2f} e-")
         plt.legend()
-        plt.ylabel("Number of RTN Pixels")
+        plt.xlabel("$\lambda_{max}$ (e-)")
+        plt.ylabel("Number of Pixels")
         plt.yscale('log')
         plt.show()
-    return lambda_max_arr
+    return rtn_params_array
 
-def get_new_read_noise_stats(bias_stack, rtn_params, adu_unit):
-    read_noise_array = np.sqrt(np.nanvar(bias_stack, axis=0, ddof=1)) * adu_unit
-    corr_read_noise_array = copy.deepcopy(read_noise_array)
-    for (ix, iy), params in rtn_params.items():
-        corr_read_noise_array[ix, iy] = params[4]  # sigma
-    new_mean = np.nanmean(corr_read_noise_array)
-    new_median = np.nanmedian(corr_read_noise_array)
-    new_rms = np.sqrt(np.nanmean(corr_read_noise_array**2))
-    new_stats = {"mean_read_noise": new_mean,
-                 "median_read_noise": new_median,
-                 "rms_read_noise": new_rms}
-    return new_stats, corr_read_noise_array
-
-def plot_snr_ratio(lambda_max_arr, old_stats, new_stats):
-    # For increasing electron flux, plot SNR of RTN correction for each pixel.
-    flux_values = np.linspace(0.1, 30, 300)  # e-/pix/frame
+def get_snr_ratio(read_noise_arr, rtn_params_arr, plot=False):
+    plt.rcParams.update({'font.size': 14})
+    # set nans to zero
+    rtn_params_arr = np.nan_to_num(rtn_params_arr)
+    old_read_noise = np.sqrt(np.mean(read_noise_arr**2))
+    flux_values = np.logspace(-1, 1.5, 20)
     snr_values_old = np.zeros_like(flux_values)
     snr_values_corr = np.zeros_like(flux_values)
-    old_rms = old_stats["rms_read_noise"].to(u.electron).value
-    new_rms = new_stats["rms_read_noise"].to(u.electron).value
-    for i, lam in enumerate(flux_values):
-        # Interpolate between old and new rms read noise based on how many pixels can be corrected at this flux
-        frac_correctable = np.sum(lambda_max_arr >= lam) / len(lambda_max_arr)
-        effective_rms = (1 - frac_correctable) * old_rms + frac_correctable * new_rms
-        snr_values_old[i] = lam / np.sqrt(lam + old_rms**2)
-        snr_values_corr[i] = lam / np.sqrt(lam + effective_rms**2)
-    plt.rcParams.update({'font.size': 14})
-    plt.plot(flux_values, snr_values_corr / snr_values_old)
-    plt.xlabel("Electron Flux (e-/pix/frame)")
-    plt.ylabel("Relative SNR Improvement")
-    # Put y grid lines
-    plt.grid(axis='y')
-    plt.xscale('log')
-    plt.show()
+    for i, flux in enumerate(flux_values):
+        correctable_mask = (rtn_params_arr[5] >= flux) & (~np.isnan(rtn_params_arr[0]))
+        eff_read_noise_arr = read_noise_arr * ~correctable_mask + rtn_params_arr[4] * correctable_mask
+        new_read_noise = np.sqrt(np.mean(eff_read_noise_arr**2))
+        noise_old = np.sqrt(flux + old_read_noise**2)
+        noise_corr = np.sqrt(flux + new_read_noise**2)
+        snr_values_old[i] = np.mean(flux / noise_old)
+        snr_values_corr[i] = np.mean(flux / noise_corr)
+    if plot:
+        plt.plot(flux_values, snr_values_corr / snr_values_old, 'b')
+        plt.xlabel('Flux (e-)')
+        plt.ylabel('SNR Improvement Factor')
+        plt.xscale('log')
+        plt.axhline(1.0, color='grey', linestyle='-', linewidth=1)
+        plt.show()
     return flux_values, snr_values_corr / snr_values_old
-
-def plot_naive_corrected(data, rtn_params, adu_unit):
-    # Plot histogram of read noise before correction and the best possible correction.
-    old_stats, read_noise_array = get_read_noise_stats(data, adu_unit)
-    new_stats, corr_read_noise_array = get_new_read_noise_stats(data, rtn_params, adu_unit)
-    plt.rcParams.update({'font.size': 14})
-    plt.hist(read_noise_array.flatten().to(u.electron).value, bins=200, histtype='step', alpha=0.7, label='Before Correction')
-    plt.hist(corr_read_noise_array.flatten().to(u.electron).value, bins=200, histtype='step', alpha=0.7, label='Best-case Correction')
-    plt.axvline(old_stats["median_read_noise"].to(u.electron).value, color='red', linestyle='dashed', linewidth=1, label=f"Old Median: {old_stats['median_read_noise']:.2f}")
-    plt.axvline(old_stats["rms_read_noise"].to(u.electron).value, color='blue', linestyle='dashed', linewidth=1, label=f"Old RMS: {old_stats['rms_read_noise']:.2f}")
-    plt.axvline(new_stats["rms_read_noise"].to(u.electron).value, color='green', linestyle='dashed', linewidth=1, label=f"Best Case RMS: {new_stats['rms_read_noise']:.2f}")
-    plt.xlabel("Read Noise (e-)")
-    plt.ylabel("Number of Pixels")
-    plt.yscale('log')
-    plt.legend()
-    plt.show()
-    return
 
 if __name__ == "__main__":
     t0 = time.time()
@@ -373,6 +344,7 @@ if __name__ == "__main__":
     bias_stack = fits.open(bias_stack_file)[0].data.astype(np.int32)
     t1 = time.time()
     print(f"Loaded bias stack in {t1 - t0:.2f} seconds.")
+    lut = ThresholdLUT.load('rts_threshold_lut.pkl')
     # Not sigma clipping for now. Doesn't do much and introduces NaNs.
     # bias_stack = sigma_clip(bias_stack, sigma=10, max_iters=5)
     adu = u.electron / gain
@@ -384,24 +356,13 @@ if __name__ == "__main__":
     print(f"Identified {nonnormal_pix} non-normal pixels.")
     t3 = time.time()
     print(f"Identified non-normal pixels in {t3 - t2:.2f} seconds.")
-    rtn_params, rtn_mask = fit_rtn_parameters(bias_stack, nonnormal_mask, read_noise_stats, adu, min_spacing=3, verbose=True)
+    rtn_params_arr, rtn_mask = fit_rtn_parameters(bias_stack, nonnormal_mask, read_noise_stats, adu, min_spacing=3, verbose=True)
     t4 = time.time()
     print(f"Fit RTN parameters in {t4 - t3:.2f} seconds.")
-    print(f"Identified {len(rtn_params)} correctable RTN pixels.")
-    # Save rtn_params to a fits file, including the mask. Should have shape (6, nx, ny).
-    # Any pixels without correctable RTN get NaNs.
-    nx, ny = bias_stack.shape[1], bias_stack.shape[2]
-    rtn_params_array = np.full((5, nx, ny), np.nan)
-    for (ix, iy), params in rtn_params.items():
-        rtn_params_array[0, ix, iy] = params[0].to(adu).value  # mu
-        rtn_params_array[1, ix, iy] = params[1]                 # A
-        rtn_params_array[2, ix, iy] = params[2]                 # B
-        rtn_params_array[3, ix, iy] = params[3].to(adu).value  # d
-        rtn_params_array[4, ix, iy] = params[4].to(adu).value  # sigma
+    print(f"Identified {np.sum(rtn_mask)} correctable RTN pixels.")
+    rtn_params_array = add_lambda_max(rtn_params_arr, lut, plot=True)
+    # Save rtn_params to a fits file.
     hdu = fits.PrimaryHDU(rtn_params_array)
     hdu.writeto('rtn_params.fits', overwrite=True)
     print("Saved RTN parameters to rtn_params.fits")
-    lambda_max_arr = get_lambda_max_arr(rtn_params, threshold=3.5, plot=True)
-    plot_naive_corrected(bias_stack, rtn_params, adu)
-    corr_stats, corr_read_noise_array = get_new_read_noise_stats(bias_stack, rtn_params, adu)
-    plot_snr_ratio(lambda_max_arr, read_noise_stats, corr_stats)
+    fluxes, snr_ratios = get_snr_ratio(read_noise_array.to(u.electron).value, rtn_params_array, plot=True)

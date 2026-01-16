@@ -12,58 +12,70 @@ from collections import deque
 import numpy as np
 from numba import njit
 from astropy.io import fits
-
-def load_lut(filename):
-    data = np.load(filename)
-    return (data['lam'], data['rn'], data['dx'],
-            data['ll'], data['lh'], data['hl'], data['hh'])
-
+from scripts.make_lut import ThresholdLUT
 
 @njit
-def lookup_thresholds(lam, rn, dx, lam_vals, rn_vals, dx_vals,
-                      grid_ll, grid_lh, grid_hl, grid_hh):
-    """
-    Numba-compatible trilinear interpolation for all four thresholds.
-    
-    Returns (low_lo, low_hi, high_lo, high_hi).
-    Returns NaNs if peaks blend (high_lo > lam + dx).
-    """
+def interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, data):
+    """Trilinear interpolation on regular grid."""
+    # Find indices
     i = np.searchsorted(lam_vals, lam) - 1
     j = np.searchsorted(rn_vals, rn) - 1
     k = np.searchsorted(dx_vals, dx) - 1
     
+    # Clamp to valid range
     i = max(0, min(i, len(lam_vals) - 2))
     j = max(0, min(j, len(rn_vals) - 2))
     k = max(0, min(k, len(dx_vals) - 2))
     
+    # Fractional position within cell
     t = (lam - lam_vals[i]) / (lam_vals[i+1] - lam_vals[i])
     u = (rn - rn_vals[j]) / (rn_vals[j+1] - rn_vals[j])
     v = (dx - dx_vals[k]) / (dx_vals[k+1] - dx_vals[k])
     
-    w000 = (1-t) * (1-u) * (1-v)
-    w001 = (1-t) * (1-u) * v
-    w010 = (1-t) * u * (1-v)
-    w011 = (1-t) * u * v
-    w100 = t * (1-u) * (1-v)
-    w101 = t * (1-u) * v
-    w110 = t * u * (1-v)
-    w111 = t * u * v
+    # Clamp fractions
+    t = max(0.0, min(1.0, t))
+    u = max(0.0, min(1.0, u))
+    v = max(0.0, min(1.0, v))
     
-    def interp(grid):
-        return (w000 * grid[i, j, k] + w001 * grid[i, j, k+1] +
-                w010 * grid[i, j+1, k] + w011 * grid[i, j+1, k+1] +
-                w100 * grid[i+1, j, k] + w101 * grid[i+1, j, k+1] +
-                w110 * grid[i+1, j+1, k] + w111 * grid[i+1, j+1, k+1])
+    # Trilinear interpolation
+    c000 = data[i, j, k]
+    c001 = data[i, j, k+1]
+    c010 = data[i, j+1, k]
+    c011 = data[i, j+1, k+1]
+    c100 = data[i+1, j, k]
+    c101 = data[i+1, j, k+1]
+    c110 = data[i+1, j+1, k]
+    c111 = data[i+1, j+1, k+1]
     
-    high_lo = interp(grid_hl)
-    
-    # Peaks blend if lower bound of high peak exceeds its center
-    if high_lo > lam + dx:
-        return np.nan, np.nan, np.nan, np.nan
-    
-    return interp(grid_ll), interp(grid_lh), high_lo, interp(grid_hh)
+    return (c000 * (1-t) * (1-u) * (1-v) +
+            c001 * (1-t) * (1-u) * v +
+            c010 * (1-t) * u * (1-v) +
+            c011 * (1-t) * u * v +
+            c100 * t * (1-u) * (1-v) +
+            c101 * t * (1-u) * v +
+            c110 * t * u * (1-v) +
+            c111 * t * u * v)
 
-lut_lam, lut_rn, lut_dx, lut_ll, lut_lh, lut_hl, lut_hh = load_lut('rts_lut.npz')
+
+@njit
+def get_thresholds_numba(lam, rn, dx, lam_vals, rn_vals, dx_vals,
+                         ll_data, lh_data, hl_data, hh_data):
+    """Get all four thresholds."""
+    ll = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, ll_data)
+    lh = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, lh_data)
+    hl = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, hl_data)
+    hh = interp3d(lam, rn, dx, lam_vals, rn_vals, dx_vals, hh_data)
+    return ll, lh, hl, hh
+
+# Extract once at setup for numba-compatible interpolation
+lut = ThresholdLUT.load('rts_threshold_lut.pkl')
+lam_vals = lut.lam_vals
+rn_vals = lut.rn_vals
+dx_vals = lut.dx_vals
+ll_data = lut.low_peak_low
+lh_data = lut.low_peak_high
+hl_data = lut.high_peak_low
+hh_data = lut.high_peak_high
 
 @njit
 def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e, 
@@ -83,10 +95,10 @@ def _correct_frame(frame, rolling_mean, rtn_mask, delta_x_arr_e, mu_e,
                 lam = 0
             noise = np.sqrt(lam + read_noise_e[y, x]**2)
             delta = delta_x_arr_e[y, x]
-            low_lo, low_hi, high_lo, high_hi = lookup_thresholds(
+            low_lo, low_hi, high_lo, high_hi = get_thresholds_numba(
                 lam, read_noise_e[y, x], delta,
-                lut_lam, lut_rn, lut_dx,
-                lut_ll, lut_lh, lut_hl, lut_hh
+                lam_vals, rn_vals, dx_vals,
+                ll_data, lh_data, hl_data, hh_data
             )
             if np.isnan(low_lo):
                 num_skipped += 1
@@ -202,6 +214,7 @@ def main():
             continue
 
         rolling_mean = rolling_sum / len(window_buffer)
+        # rolling_median = np.median(np.array(window_buffer), axis=0)
         center_frame = window_buffer[half_w]
         
         corrected, num_corr_arr = _correct_frame(
