@@ -149,12 +149,12 @@ def main():
     e_per_adu = 1.0 / args.gain
     rtn_mask = ~np.isnan(rtn_params[0])
     print(np.sum(rtn_mask), "RTN pixels detected.")
-    delta_x_arr_e = np.ascontiguousarray(rtn_params[3] * e_per_adu)
-    mu_e = e_per_adu * ((rtn_params[0] * rtn_params[1]) +
-                        (rtn_params[0] - rtn_params[3]) * rtn_params[2] +
-                        (rtn_params[0] + rtn_params[3]) * (1 - rtn_params[1] - rtn_params[2]))
-    mu_e = np.ascontiguousarray(mu_e)
-    read_noise_e = np.ascontiguousarray(rtn_params[4] * e_per_adu)
+    delta_x_arr_e = np.ascontiguousarray(rtn_params[3], dtype=np.float64)
+    mu_e = ((rtn_params[0] * rtn_params[1]) +
+            (rtn_params[0] - rtn_params[3]) * rtn_params[2] +
+            (rtn_params[0] + rtn_params[3]) * (1 - rtn_params[1] - rtn_params[2]))
+    mu_e = np.ascontiguousarray(mu_e, dtype=np.float64)
+    read_noise_e = np.ascontiguousarray(rtn_params[4], dtype=np.float64)
     num_corr_arr = np.zeros((2, *rtn_mask.shape), dtype=np.int32)
 
     # Validate reference method arguments

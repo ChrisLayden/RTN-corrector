@@ -132,7 +132,13 @@ class ThresholdLUT:
         
         inv_interp = interp1d(delta_x_min_curve, self.lam_vals,
                               bounds_error=False, fill_value=(0.0, np.inf))
-        result = inv_interp(delta_x)
+        try:
+            result = inv_interp(delta_x)
+        except ValueError:
+            if np.isscalar(delta_x):
+                return float(100.0)
+            else:
+                raise(ValueError("One or more delta_x values out of interpolation bounds"))
         if np.isscalar(delta_x):
             return float(result)
         return result
