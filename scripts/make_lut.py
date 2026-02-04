@@ -158,7 +158,7 @@ class ThresholdLUT:
 if __name__ == "__main__":
     lut = ThresholdLUT(
         lam_range=np.linspace(0, 100, 200),
-        read_noise_range=np.linspace(0.5, 10.0, 200),
+        read_noise_range=np.linspace(0.1, 10.0, 200),
         alpha=0.003
     )
     lut.save('rts_threshold_lut.pkl')

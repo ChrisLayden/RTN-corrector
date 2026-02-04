@@ -71,7 +71,9 @@ def get_read_noise_stats(data, adu_unit, plot=False, save_path=None):
             plt.close()
     return read_noise_stats, read_noise_array
 
-def smooth_data(data):
+def smooth_data(data, random_seed=None):
+    if random_seed is not None:
+        np.random.seed(random_seed)
     smoothing_arr = np.random.uniform(-0.5, 0.5, size=data.shape)
     smoothed_data = data + smoothing_arr
     return smoothed_data
@@ -79,7 +81,8 @@ def smooth_data(data):
 def ad_statistics_normal(data):
     n, nx, ny = data.shape
     clipped_data = sigma_clip(data, sigma=5, max_iters=3)
-    smoothed_data = smooth_data(clipped_data)
+    # Use fixed random seed for reproducibility
+    smoothed_data = smooth_data(clipped_data, random_seed=42)
     sorted_data = np.sort(smoothed_data, axis=0)
     mean = np.mean(sorted_data, axis=0, keepdims=True)
     std = np.std(sorted_data, axis=0, ddof=1, keepdims=True)
@@ -152,6 +155,7 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
     rtn_params_array = np.full((6, data.shape[1], data.shape[2]), np.nan)
     poor_fit_count = 0
     too_close_count = 0
+    too_rare_count = 0
     fit_fail_count = 0
     n_images, nx, ny = data.shape
     for ix in range(nx):
@@ -182,15 +186,18 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                                        jac=rtn_triple_gaussian_jac)
                 mu_fit = popt[0]
                 A_fit = popt[1] / (popt[1] + popt[2] + popt[3])  # Normalize A
-                B_fit = popt[2] / (popt[1] + popt[2] + popt[3])  # Normalize B1
+                B1_fit = popt[2] / (popt[1] + popt[2] + popt[3])  # Normalize B1
+                B2_fit = popt[3] / (popt[1] + popt[2] + popt[3])  # Normalize B2
                 d_fit = popt[4]
                 sigma_fit = popt[5]
                 errs = np.sqrt(np.diag(pcov))
-                if np.any(popt / errs < 3) or B_fit > A_fit:
+                if np.any(popt / errs < 3) or B1_fit > A_fit or B2_fit > A_fit:
                     poor_fit_count += 1
-                elif (d_fit >= 3 * sigma_fit) and A_fit < 0.95:
+                elif A_fit > 0.95:
+                    too_rare_count += 1
+                elif (d_fit >= 3 * sigma_fit):
                     rtn_params_array[:-1, ix, iy] = [(mu_fit * adu_unit).to(u.electron).value,
-                                                   A_fit, B_fit,
+                                                   A_fit, B1_fit,
                                                    (d_fit * adu_unit).to(u.electron).value,
                                                    (sigma_fit * adu_unit).to(u.electron).value]
                     rtn_mask[ix, iy] = True
@@ -199,7 +206,7 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
             except RuntimeError:
                 fit_fail_count += 1
                 continue
-    print(f"Poor fits: {poor_fit_count}, Too close: {too_close_count}, Fit failures: {fit_fail_count}")
+    print(f"Poor fits: {poor_fit_count}, Too close: {too_close_count}, Too rare: {too_rare_count}, Fit failures: {fit_fail_count}")
     return rtn_params_array, rtn_mask
 
 def add_lambda_max(rtn_params_array, lut, plot=False, save_path=None):
@@ -218,9 +225,9 @@ def add_lambda_max(rtn_params_array, lut, plot=False, save_path=None):
         plt.figure()
         plt.hist(rtn_params_array[5, ~np.isnan(rtn_params_array[0])].flatten(), bins=200, histtype='step', alpha=0.7)
         median_lambda_max = np.median(rtn_params_array[5, ~np.isnan(rtn_params_array[0])])
-        plt.axvline(median_lambda_max, color='red', linestyle='dashed', linewidth=1, label=r"Median $\lambda_{max}$" + f": {median_lambda_max:.2f} e-")
+        plt.axvline(median_lambda_max, color='red', linestyle='dashed', linewidth=1, label=r"Median $\lambda_{max}$" + f": {median_lambda_max:.2f} e-/pix/frame")
         plt.legend()
-        plt.xlabel(r"$\lambda_{max}$ (e-)")
+        plt.xlabel(r"$\lambda_{max}$ (e-/pix/frame)")
         plt.ylabel("Number of Pixels")
         plt.yscale('log')
         if save_path:
@@ -250,7 +257,7 @@ def get_snr_ratio(read_noise_arr, rtn_params_arr, plot=False, save_path=None):
     if plot or save_path:
         plt.figure()
         plt.plot(flux_values, snr_values_corr / snr_values_old, 'b')
-        plt.xlabel('Flux (e-)')
+        plt.xlabel('Flux (e-/pix/frame)')
         plt.ylabel('SNR Improvement Factor')
         plt.xscale('log')
         plt.axhline(1.0, color='grey', linestyle='-', linewidth=1)
@@ -262,6 +269,35 @@ def get_snr_ratio(read_noise_arr, rtn_params_arr, plot=False, save_path=None):
         else:
             plt.close()
     return flux_values, snr_values_corr / snr_values_old
+
+def get_new_read_noise(read_noise_arr, rtn_params_arr, plot=False, save_path=None):
+    plt.rcParams.update({'font.size': 14})
+    rtn_params_arr = np.nan_to_num(rtn_params_arr)
+    old_read_noise = np.sqrt(np.mean(read_noise_arr**2))
+    flux_values = np.logspace(-1, 2, 20)
+    new_read_noise_vals = np.zeros_like(flux_values)
+    for i, flux in enumerate(flux_values):
+        correctable_mask = (rtn_params_arr[5] >= flux) & (~np.isnan(rtn_params_arr[0]))
+        eff_read_noise_arr = read_noise_arr * ~correctable_mask + rtn_params_arr[4] * correctable_mask
+        new_read_noise = np.sqrt(np.mean(eff_read_noise_arr**2))
+        new_read_noise_vals[i] = new_read_noise
+    if plot or save_path:
+        plt.figure()
+        plt.plot(flux_values, new_read_noise_vals, 'b')
+        plt.xlabel('Flux (e-/pix/frame)')
+        plt.ylabel('Post-correction RMS Read Noise (e-)')
+        plt.xscale('log')
+        plt.axhline(old_read_noise, color='grey', linestyle='-', linewidth=1)
+        # Label the old read noise line
+        plt.text(flux_values[0], old_read_noise * 0.99, f'Raw RMS Read Noise: {old_read_noise:.2f} e-', color='grey', va='top', ha='left')
+        if save_path:
+            plt.savefig(os.path.join(save_path, 'eff_read_noise.png'), dpi=150, bbox_inches='tight')
+        if plot:
+            plt.show(block=False)
+            plt.pause(0.1)
+        else:
+            plt.close()
+    return flux_values, new_read_noise_vals
 
 def load_bias_stack(folder, frames_to_keep=None):
     fits_files = sorted(glob(os.path.join(folder, '*.fits')) + glob(os.path.join(folder, '*.fit')))
@@ -316,7 +352,7 @@ def main():
     t0 = time.time()
     print("Loading bias stack...")
     bias_stack = load_bias_stack(args.bias_folder, frames_to_keep=frames_to_keep)
-    # bias_stack = bias_stack[:,:10,:]
+    # bias_stack = bias_stack[:,:100,:]
     t1 = time.time()
     print(f"Loaded bias stack ({bias_stack.shape[0]} frames) in {t1 - t0:.2f} seconds.")
 
@@ -326,6 +362,11 @@ def main():
     frames_for_stats = min(1000, bias_stack.shape[0])
     print(f"Computing read noise statistics using first {frames_for_stats} frames...")
     read_noise_stats, read_noise_array = get_read_noise_stats(bias_stack[:frames_for_stats], adu, plot=plot, save_path=plots_save_path)
+    # Save read noise array to read_noise_frame.fits
+    fits.writeto(os.path.join(output_dir, 'read_noise_frame.fits'), read_noise_array.to_value(u.electron), overwrite=True)
+    # Save median bias frame to median_bias_frame.fits
+    median_bias_frame = np.median(bias_stack[:frames_for_stats], axis=0)
+    fits.writeto(os.path.join(output_dir, 'median_bias_frame.fits'), median_bias_frame, overwrite=True)
     t2 = time.time()
     print(f"Computed read noise stats in {t2 - t1:.2f} seconds.")
 
@@ -356,7 +397,9 @@ def main():
         print("Computing SNR improvement...")
         fluxes, snr_ratios = get_snr_ratio(read_noise_array.to(u.electron).value, rtn_params_array,
                                             plot=plot, save_path=plots_save_path)
-        
+        print("Computing effective read noise after correction...")
+        fluxes, new_read_noise_vals = get_new_read_noise(read_noise_array.to(u.electron).value, rtn_params_array,
+                                                        plot=plot, save_path=plots_save_path)
     print("Done.")
     if plot:
         plt.ioff()
