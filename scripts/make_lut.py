@@ -159,9 +159,9 @@ if __name__ == "__main__":
     lut = ThresholdLUT(
         lam_range=np.linspace(0, 100, 200),
         read_noise_range=np.linspace(0.1, 10.0, 200),
-        alpha=0.003
+        alpha=0.005
     )
-    lut.save('rts_threshold_lut.pkl')
+    lut.save('rts_threshold_lut_alpha_005.pkl')
 
     print("Central thresholds:", lut.get_central_thresholds(lam=5, read_noise=1.5))
     print("Peak thresholds:", lut.get_peak_thresholds(lam=5, read_noise=1.5, delta_x=10))
