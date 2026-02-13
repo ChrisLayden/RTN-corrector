@@ -40,7 +40,8 @@ def get_read_noise_stats(data, adu_unit, plot=False, save_path=None):
         raise ValueError("Input data must be a 3D array of images.")
     if data.shape[0] < 10:
         raise ValueError("At least ten bias images required to compute per-pixel read noise.")
-    data = data * adu_unit
+    if adu_unit is not None:
+        data = data * adu_unit
     read_var_array = np.nanvar(data, axis=0, ddof=1)
     read_noise_array = np.sqrt(read_var_array)
     mean_read_noise = np.nanmean(read_noise_array)
@@ -58,9 +59,13 @@ def get_read_noise_stats(data, adu_unit, plot=False, save_path=None):
         plt.xlabel("Read Noise (e-)" if adu_unit is not None else "Read Noise (ADU)")
         plt.ylabel("Number of Pixels")
         plt.yscale('log')
-        plt.axvline(mean_read_noise.value, color='red', linestyle='dashed', linewidth=1, label=f"Mean: {mean_read_noise:.2f}")
-        plt.axvline(median_read_noise.value, color='blue', linestyle='dashed', linewidth=1, label=f"Median: {median_read_noise:.2f}")
-        plt.axvline(rms_read_noise.value, color='green', linestyle='dashed', linewidth=1, label=f"RMS: {rms_read_noise:.2f}")
+        # Handle both unit and non-unit cases
+        mean_val = mean_read_noise.value if hasattr(mean_read_noise, 'value') else mean_read_noise
+        median_val = median_read_noise.value if hasattr(median_read_noise, 'value') else median_read_noise
+        rms_val = rms_read_noise.value if hasattr(rms_read_noise, 'value') else rms_read_noise
+        plt.axvline(mean_val, color='red', linestyle='dashed', linewidth=1, label=f"Mean: {mean_read_noise:.2f}")
+        plt.axvline(median_val, color='blue', linestyle='dashed', linewidth=1, label=f"Median: {median_read_noise:.2f}")
+        plt.axvline(rms_val, color='green', linestyle='dashed', linewidth=1, label=f"RMS: {rms_read_noise:.2f}")
         plt.legend()
         if save_path:
             plt.savefig(os.path.join(save_path, 'read_noise_histogram.png'), dpi=150, bbox_inches='tight')
@@ -101,12 +106,17 @@ def identify_nonnormal_pixels(data, adu_unit, threshold=1.092, plot=False, save_
     low_cutoff = read_noise_stats["median_read_noise"]
     nonnormal_mask = (A2 > threshold) & (read_noise_array > low_cutoff)
     if plot or save_path:
-        read_noise_array = read_noise_array.to(u.electron).value
+        # Convert to electron units if available, otherwise use as-is (ADU)
+        if hasattr(read_noise_array, 'to'):
+            read_noise_array = read_noise_array.to(u.electron).value
+            xlabel = "Read Noise (e-)"
+        else:
+            xlabel = "Read Noise (ADU)"
         nonnormal_read_noise = read_noise_array[nonnormal_mask]
         plt.figure()
-        plt.hist(read_noise_array.flatten(), bins=200, range=(0, np.max(read_noise_array)), histtype='step', alpha=0.3, label='All Pixels')
-        plt.hist(nonnormal_read_noise.flatten(), bins=200, range=(0, np.max(read_noise_array)), histtype='step', alpha=0.7, label='Pixels failing AD test')
-        plt.xlabel("Read Noise (e-)")
+        plt.hist(read_noise_array.flatten(), bins=200, range=(0, np.percentile(read_noise_array, 99.95)), histtype='step', alpha=0.3, label='All Pixels')
+        plt.hist(nonnormal_read_noise.flatten(), bins=200, range=(0, np.percentile(read_noise_array, 99.95)), histtype='step', alpha=0.7, label='Pixels failing AD test')
+        plt.xlabel(xlabel)
         plt.ylabel("Number of Non-normal Pixels")
         plt.yscale('log')
         plt.title("Read Noise Distribution of Non-normal Pixels")
@@ -157,6 +167,8 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
     too_close_count = 0
     too_rare_count = 0
     fit_fail_count = 0
+    rtn_count = 0
+    single_sided_count = 0
     n_images, nx, ny = data.shape
     for ix in range(nx):
         if verbose:
@@ -165,14 +177,20 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
             if not nonnormal_mask[ix, iy]:
                 continue
             pixel_data = data[:, ix, iy]
-            bins_min = np.round(np.percentile(pixel_data, 0.5) - adu_unit.to(u.electron).value).astype(int)
-            bins_max = np.round(np.percentile(pixel_data, 99.5) + adu_unit.to(u.electron).value).astype(int)
+            # Handle both unit and non-unit cases
+            unit_offset = adu_unit.to(u.electron).value if adu_unit is not None else 1.0
+            bins_min = np.round(np.percentile(pixel_data, 0.5) - unit_offset).astype(int)
+            bins_max = np.round(np.percentile(pixel_data, 99.5) + unit_offset).astype(int)
             bin_size = np.round(np.max([1, (bins_max - bins_min) / 30])).astype(int)
             bins = np.arange(bins_min, bins_max + bin_size, bin_size)
             counts, bin_edges = np.histogram(pixel_data, bins=bins, density=True)
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
             mu_guess = np.mean(pixel_data)
-            sigma_guess = read_noise_stats['median_read_noise'].to(adu_unit).value
+            # Convert sigma_guess to appropriate units
+            if adu_unit is not None:
+                sigma_guess = read_noise_stats['median_read_noise'].to(adu_unit).value
+            else:
+                sigma_guess = read_noise_stats['median_read_noise']
             A_guess = np.max(counts)
             B1_guess = 0.1 * A_guess
             B2_guess = 0.1 * A_guess
@@ -184,28 +202,64 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                 popt, pcov = curve_fit(rtn_triple_gaussian, bin_centers, counts, p0=p0,
                                        maxfev=100, bounds=bounds, full_output=False,
                                        jac=rtn_triple_gaussian_jac)
+                errs = np.sqrt(np.diag(pcov))
                 mu_fit = popt[0]
                 A_fit = popt[1] / (popt[1] + popt[2] + popt[3])  # Normalize A
                 B1_fit = popt[2] / (popt[1] + popt[2] + popt[3])  # Normalize B1
                 B2_fit = popt[3] / (popt[1] + popt[2] + popt[3])  # Normalize B2
                 d_fit = popt[4]
                 sigma_fit = popt[5]
-                errs = np.sqrt(np.diag(pcov))
-                if np.any(popt / errs < 3) or B1_fit > A_fit or B2_fit > A_fit:
+                A_err = errs[1] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized A
+                B1_err = errs[2] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized B1
+                B2_err = errs[3] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized B2
+                bad_fit_checks = abs(popt / errs) < 3
+                # Allow for case where one of the tails is consistent with zero 
+                if abs(B1_fit) < 0.02 and B1_err < 0.05:
+                    bad_fit_checks[2] = False
+                    single_sided = True
+                elif abs(B2_fit) < 0.02 and B2_err < 0.05:
+                    bad_fit_checks[3] = False
+                    single_sided = True
+                else:
+                    single_sided = False
+                if np.any(bad_fit_checks) or B1_fit > A_fit or B2_fit > A_fit:
+                    # x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
+                    # y_fit = rtn_triple_gaussian(x_fit, *popt)
+                    # plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, 1), density=True, histtype='step', alpha=0.3, label='Pixel Data')
+                    # plt.plot(x_fit, y_fit, 'r-', label='Fit')
+                    # print(B1_fit, B1_err)
+                    # plt.xlabel("Pixel Value (ADU)")
+                    # plt.ylabel("Density")
+                    # plt.show(block=True)
                     poor_fit_count += 1
                 elif A_fit > 0.95:
                     too_rare_count += 1
                 elif (d_fit >= 3 * sigma_fit):
-                    rtn_params_array[:-1, ix, iy] = [(mu_fit * adu_unit).to(u.electron).value,
-                                                   A_fit, B1_fit,
-                                                   (d_fit * adu_unit).to(u.electron).value,
-                                                   (sigma_fit * adu_unit).to(u.electron).value]
+                    # plt.plot(bin_centers, counts, 'b.', label='Data')
+                    # x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
+                    # y_fit = rtn_triple_gaussian(x_fit, *popt)
+                    # plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, 1), density=True, histtype='step', alpha=0.3, label='Pixel Data')
+                    # plt.xlabel("Pixel Value (ADU)")
+                    # plt.ylabel("Density")
+                    # plt.show(block=True)
+                    # Convert to electrons if adu_unit is available, otherwise keep in ADU
+                    if adu_unit is not None:
+                        rtn_params_array[:-1, ix, iy] = [(mu_fit * adu_unit).to(u.electron).value,
+                                                       A_fit, B1_fit,
+                                                       (d_fit * adu_unit).to(u.electron).value,
+                                                       (sigma_fit * adu_unit).to(u.electron).value]
+                    else:
+                        rtn_params_array[:-1, ix, iy] = [mu_fit, A_fit, B1_fit, d_fit, sigma_fit]
                     rtn_mask[ix, iy] = True
+                    rtn_count += 1
+                    if single_sided:
+                        single_sided_count += 1
                 else:
                     too_close_count += 1
             except RuntimeError:
                 fit_fail_count += 1
                 continue
+    print(f"Identified {rtn_count} correctable RTN pixels. {single_sided_count} are single-sided.")
     print(f"Poor fits: {poor_fit_count}, Too close: {too_close_count}, Too rare: {too_rare_count}, Fit failures: {fit_fail_count}")
     return rtn_params_array, rtn_mask
 
@@ -305,29 +359,73 @@ def load_bias_stack(folder, frames_to_keep=None):
     fits_files = sorted(glob(os.path.join(folder, '*.fits')) + glob(os.path.join(folder, '*.fit')))
     if not fits_files:
         raise FileNotFoundError(f"No FITS files found in {folder}")
-    if frames_to_keep is None:
-        print(f"Found {len(fits_files)} FITS files.")
-        frames_to_keep = len(fits_files)
-    elif frames_to_keep > len(fits_files):
-        print(f"Requested {frames_to_keep} frames, but only found {len(fits_files)}. Using all available frames.")
-        frames_to_keep = len(fits_files)
-    else:
-        print(f"Found {len(fits_files)} FITS files. Keeping first {frames_to_keep} frames.")
-    frame_shape = fits.open(fits_files[0])[0].data.shape
-    bias_stack = np.zeros((frames_to_keep, frame_shape[0], frame_shape[1]), dtype=np.int32)
-    for i, file in enumerate(fits_files):
-        if i >= frames_to_keep:
-            break
+
+    # First pass: count total frames and determine frame shape
+    total_frames = 0
+    frame_shape_2d = None
+    file_frame_counts = []
+
+    for file in fits_files:
         with fits.open(file) as hdul:
-            bias_stack[i] = hdul[0].data.astype(np.int32)
+            data_shape = hdul[0].data.shape
+            if len(data_shape) == 2:
+                # Single 2D frame
+                file_frame_counts.append(1)
+                total_frames += 1
+                if frame_shape_2d is None:
+                    frame_shape_2d = data_shape
+            elif len(data_shape) == 3:
+                # 3D cube of frames
+                file_frame_counts.append(data_shape[0])
+                total_frames += data_shape[0]
+                if frame_shape_2d is None:
+                    frame_shape_2d = data_shape[1:]
+            else:
+                raise ValueError(f"Unexpected data shape {data_shape} in {file}. Expected 2D or 3D arrays.")
+
+    print(f"Found {len(fits_files)} FITS file(s) containing {total_frames} total frame(s).")
+
+    # Determine how many frames to actually load
+    if frames_to_keep is None:
+        frames_to_keep = total_frames
+        print(f"Loading all {frames_to_keep} frames.")
+    elif frames_to_keep > total_frames:
+        print(f"Requested {frames_to_keep} frames, but only found {total_frames}. Using all available frames.")
+        frames_to_keep = total_frames
+    else:
+        print(f"Loading first {frames_to_keep} of {total_frames} available frames.")
+
+    # Allocate output array
+    bias_stack = np.zeros((frames_to_keep, frame_shape_2d[0], frame_shape_2d[1]), dtype=np.int32)
+
+    # Second pass: load frames
+    frame_idx = 0
+    for file_idx, file in enumerate(fits_files):
+        if frame_idx >= frames_to_keep:
+            break
+
+        with fits.open(file) as hdul:
+            data = hdul[0].data.astype(np.int32)
+
+            if len(data.shape) == 2:
+                # Single 2D frame
+                bias_stack[frame_idx] = data
+                frame_idx += 1
+            else:
+                # 3D cube - load frames one at a time
+                n_frames_in_cube = data.shape[0]
+                frames_to_load = min(n_frames_in_cube, frames_to_keep - frame_idx)
+                bias_stack[frame_idx:frame_idx + frames_to_load] = data[:frames_to_load]
+                frame_idx += frames_to_load
+
     return bias_stack
 
 def main():
     parser = argparse.ArgumentParser(description='Identify and fit RTN parameters from bias frames.')
     parser.add_argument('bias_folder', type=str, help='Folder containing bias FITS files')
-    parser.add_argument('gain', type=float, help='Gain in ADU/e-')
+    parser.add_argument('gain', type=float, nargs='?', default=None, help='Gain in ADU/e- (optional; if not provided, analysis is done in ADU units, and results are not saved.)')
     parser.add_argument('-o', '--output', type=str, default=None,
-                        help='Output path for rtn_params.fits (default: bias_folder/rtn_params.fits)')
+                        help='Output path for rtn_params.fits (default: bias_folder/rtn_fits_output/)')
     parser.add_argument('--frames', type=int, default=None,
                         help='Number of frames to use from bias stack (default: all available)')
     parser.add_argument('--lut', type=str, default='rts_threshold_lut.pkl',
@@ -354,21 +452,29 @@ def main():
     t0 = time.time()
     print("Loading bias stack...")
     bias_stack = load_bias_stack(args.bias_folder, frames_to_keep=frames_to_keep)
-    # bias_stack = bias_stack[:,:100,:]
+    # bias_stack = bias_stack[:,:100,:] # For testing
+    # bias_stack = bias_stack / 16
     t1 = time.time()
     print(f"Loaded bias stack ({bias_stack.shape[0]} frames) in {t1 - t0:.2f} seconds.")
 
     lut = ThresholdLUT.load(args.lut)
-    adu = u.electron / args.gain
+    if args.gain is not None:
+        adu = u.electron / args.gain
+    else:
+        # When gain is not specified, use None to indicate ADU units
+        adu = None
+        print("Note: Gain not specified. Analysis will be performed in ADU units.")
 
     frames_for_stats = min(1000, bias_stack.shape[0])
     print(f"Computing read noise statistics using first {frames_for_stats} frames...")
     read_noise_stats, read_noise_array = get_read_noise_stats(bias_stack[:frames_for_stats], adu, plot=plot, save_path=plots_save_path)
-    # Save read noise array to read_noise_frame.fits
-    fits.writeto(os.path.join(output_dir, 'read_noise_frame.fits'), read_noise_array.to_value(u.electron), overwrite=True)
-    # Save mean bias frame to mean_bias_frame.fits
-    mean_bias_frame = np.mean(bias_stack[:frames_for_stats], axis=0)
-    fits.writeto(os.path.join(output_dir, 'mean_bias_frame.fits'), mean_bias_frame, overwrite=True)
+    # Save read noise array and mean bias frame only if gain is specified
+    if args.gain is not None:
+        # Save read noise array to read_noise_frame.fits
+        fits.writeto(os.path.join(output_dir, 'read_noise_frame.fits'), read_noise_array.to_value(u.electron), overwrite=True)
+        # Save mean bias frame to mean_bias_frame.fits
+        mean_bias_frame = np.mean(bias_stack[:frames_for_stats], axis=0)
+        fits.writeto(os.path.join(output_dir, 'mean_bias_frame.fits'), mean_bias_frame, overwrite=True)
     t2 = time.time()
     print(f"Computed read noise stats in {t2 - t1:.2f} seconds.")
 
@@ -385,29 +491,33 @@ def main():
                                                    verbose=args.verbose)
     t4 = time.time()
     print(f"Fit RTN parameters in {t4 - t3:.2f} seconds.")
-    print(f"Identified {np.sum(rtn_mask)} correctable RTN pixels.")
 
-    print("Computing lambda_max for RTN pixels...")
-    rtn_params_array = add_lambda_max(rtn_params_arr, lut, plot=plot, save_path=plots_save_path)
+    # Only proceed with lambda_max and saving if gain is specified
+    if args.gain is not None:
+        print("Computing lambda_max for RTN pixels...")
+        rtn_params_array = add_lambda_max(rtn_params_arr, lut, plot=plot, save_path=plots_save_path)
 
-    print("Saving RTN parameters to FITS file...")
-    hdu = fits.PrimaryHDU(rtn_params_array)
-    hdu.writeto(output_file, overwrite=True)
-    print(f"Saved RTN parameters to {output_file}")
+        print("Saving RTN parameters to FITS file...")
+        hdu = fits.PrimaryHDU(rtn_params_array)
+        hdu.writeto(output_file, overwrite=True)
+        print(f"Saved RTN parameters to {output_file}")
 
-    if plot or args.save_plots:
-        print("Computing SNR improvement...")
-        fluxes, snr_ratios = get_snr_ratio(read_noise_array.to(u.electron).value, rtn_params_array,
-                                            plot=plot, save_path=plots_save_path)
-        # Save fluxes and snr_ratios to CSV
-        with open(os.path.join(output_dir, 'snr_improvement.csv'), 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['Flux (e-/pix/frame)', 'SNR Improvement Factor'])
-            for f, r in zip(fluxes, snr_ratios):
-                writer.writerow([f, r])
-        print("Computing effective read noise after correction...")
-        fluxes, new_read_noise_vals = get_new_read_noise(read_noise_array.to(u.electron).value, rtn_params_array,
-                                                        plot=plot, save_path=plots_save_path)
+        # Only compute and save SNR plots if gain is specified
+        if plot or args.save_plots:
+            print("Computing SNR improvement...")
+            fluxes, snr_ratios = get_snr_ratio(read_noise_array.to(u.electron).value, rtn_params_array,
+                                                plot=plot, save_path=plots_save_path)
+            # Save fluxes and snr_ratios to CSV
+            with open(os.path.join(output_dir, 'snr_improvement.csv'), 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Flux (e-/pix/frame)', 'SNR Improvement Factor'])
+                for f, r in zip(fluxes, snr_ratios):
+                    writer.writerow([f, r])
+            print("Computing effective read noise after correction...")
+            fluxes, new_read_noise_vals = get_new_read_noise(read_noise_array.to(u.electron).value, rtn_params_array,
+                                                            plot=plot, save_path=plots_save_path)
+    else:
+        print("Specify gain to save RTN parameters and compute estimated SNR improvement.")
     print("Done.")
     if plot:
         plt.ioff()

@@ -47,8 +47,8 @@ python rtn_fitter.py <bias_folder> <gain> [options]
 
 | Argument | Description |
 |---|---|
-| `bias_folder` | Path to folder containing bias FITS files |
-| `gain` | Sensor gain in ADU/e⁻ |
+| `bias_folder` | Path to folder containing bias FITS files (and no other FITS files). Files can be either single 2D frames or 3D data cubes. |
+| `gain` | Sensor gain in ADU/e⁻ (optional; if omitted, analysis is done in ADU units and only the read noise histogram is saved) |
 
 **Options:**
 
@@ -71,15 +71,15 @@ python rtn_fitter.py "Sample Data/bias_cutouts" 3.26 --plot --save-plots -v
 
 | File | Description |
 |---|---|
-| `rtn_params.fits` | 6-layer FITS file containing fitted RTN parameters for each pixel: mean (e⁻), central peak fraction, low-state fraction, delta_x (e⁻), sigma (e⁻), and lambda_max (e⁻/pix/frame) |
-| `mean_bias_frame.fits` | Mean of the bias stack |
-| `read_noise_frame.fits` | Per-pixel read noise map (e⁻) |
-| `read_noise_histogram.png` | Histogram of per-pixel read noise (if `--save-plots`) |
-| `nonnormal_pixels.png` | Read noise distribution of pixels failing the Anderson-Darling normality test (if `--save-plots`) |
-| `lambda_max_histogram.png` | Distribution of maximum correctable flux per RTN pixel (if `--save-plots`) |
-| `snr_improvement.csv` | SNR improvement factor vs. flux (if `--save-plots`) |
-| `snr_improvement.png` | Plot of SNR improvement vs. flux (if `--save-plots`) |
-| `eff_read_noise.png` | Effective read noise vs. flux after correction (if `--save-plots`) |
+| `read_noise_histogram.png` | Histogram of per-pixel read noise (if `--save-plots`). Always saved regardless of whether gain is specified. |
+| `rtn_params.fits` | 6-layer FITS file containing fitted RTN parameters for each pixel: mean (e⁻), central peak fraction, low-state fraction, delta_x (e⁻), sigma (e⁻), and lambda_max (e⁻/pix/frame). Only saved if gain is specified. |
+| `mean_bias_frame.fits` | Mean of the bias stack. Only saved if gain is specified. |
+| `read_noise_frame.fits` | Per-pixel read noise map (e⁻). Only saved if gain is specified. |
+| `nonnormal_pixels.png` | Read noise distribution of pixels failing the Anderson-Darling normality test (if `--save-plots` and gain specified) |
+| `lambda_max_histogram.png` | Distribution of maximum correctable flux per RTN pixel (if `--save-plots` and gain specified) |
+| `snr_improvement.csv` | SNR improvement factor vs. flux (if `--save-plots` and gain specified) |
+| `snr_improvement.png` | Plot of SNR improvement vs. flux (if `--save-plots` and gain specified) |
+| `eff_read_noise.png` | Effective read noise vs. flux after correction (if `--save-plots` and gain specified) |
 
 ### Step 2: Correct Science Frames (`rtn_fixer.py`)
 
@@ -94,7 +94,7 @@ python rtn_fixer.py <params_folder> <input_folder> <gain> [options]
 | Argument | Description |
 |---|---|
 | `params_folder` | Path to folder containing `rtn_params.fits`, `mean_bias_frame.fits`, and `read_noise_frame.fits` (the output directory from `rtn_fitter.py`) |
-| `input_folder` | Folder containing science FITS frames to correct |
+| `input_folder` | Folder containing science FITS frames to correct. Files can be either single 2D frames or 3D data cubes. Note: 3D cubes are processed frame-by-frame and output as individual 2D FITS files (e.g., `cube_frame0000.fits`, `cube_frame0001.fits`, etc.). |
 | `gain` | Sensor gain in ADU/e⁻ |
 
 **Options (must specify exactly one reference method):**
@@ -132,5 +132,5 @@ python rtn_fixer.py "Sample Data/bias_cutouts/rtn_fits_output" "Sample Data/scie
 
 **Reference method guidance:**
 
-- **Rolling temporal median (`-w`)**: Best when you have a sequence of many frames of the same field or when the field is not oversampled. Edge frames (within half the window of the start/end) are copied without correction.
-- **Spatial median filter (`-m`)**: Works on individual frames without requiring a time series. Should only be used if the PSF is oversampled by a fair degree.
+- **Rolling temporal median (`-w`)**: Best when you have a sequence of many frames of the same field or when the field is not oversampled. Edge frames (within half the window of the start/end) are copied without correction. When using 3D cubes, the rolling window correctly handles temporal ordering across all frames in the cube(s).
+- **Spatial median filter (`-m`)**: Works on individual frames without requiring a time series. Should only be used if the PSF is oversampled by a fair degree. Each frame (whether from individual files or extracted from a cube) is processed independently.

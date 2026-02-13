@@ -134,10 +134,65 @@ def get_fits_files(folder):
     return files
 
 
-def load_frame(path):
-    """Load a single FITS frame."""
-    with fits.open(path) as hdul:
-        return hdul[0].data.astype(np.float64), hdul[0].header
+def build_frame_manifest(files):
+    """
+    Build a manifest of all frames across files.
+    Returns: list of (file_path, frame_index, output_name) tuples
+    """
+    manifest = []
+    frame_counter = 0
+
+    for file_path in files:
+        with fits.open(file_path) as hdul:
+            data_shape = hdul[0].data.shape
+
+            if len(data_shape) == 2:
+                # Single 2D frame
+                manifest.append((file_path, None, file_path.name))
+                frame_counter += 1
+            elif len(data_shape) == 3:
+                # 3D cube - each slice is a separate frame
+                n_frames = data_shape[0]
+                base_name = file_path.stem
+                ext = file_path.suffix
+                for i in range(n_frames):
+                    output_name = f"{base_name}_frame{i:04d}{ext}"
+                    manifest.append((file_path, i, output_name))
+                    frame_counter += 1
+            else:
+                raise ValueError(f"Unexpected data shape {data_shape} in {file_path}. Expected 2D or 3D arrays.")
+
+    return manifest
+
+
+def load_frame(path, frame_index=None):
+    """
+    Load a single FITS frame.
+
+    Args:
+        path: Path to FITS file
+        frame_index: If the file is a 3D cube, which frame to load (None for 2D files)
+
+    Returns:
+        frame: 2D numpy array
+        header: FITS header
+    """
+    with fits.open(path, memmap=True) as hdul:
+        data = hdul[0].data
+        header = hdul[0].header.copy()
+
+        if frame_index is not None:
+            # Extract specific frame from cube
+            # Memory mapping allows loading only this slice without reading the entire cube
+            frame = data[frame_index].astype(np.float64)
+            # Add cube frame info to header
+            header['CUBEIDX'] = frame_index
+            header['CUBEFRMS'] = data.shape[0]
+        else:
+            # Single 2D frame
+            frame = data.astype(np.float64)
+
+        return frame, header
 
 
 def main():
@@ -182,13 +237,14 @@ def main():
 
     use_rolling_median = args.window is not None
 
-    # Get file list
+    # Get file list and build frame manifest
     files = get_fits_files(args.input_folder)
-    n_frames = len(files)
+    manifest = build_frame_manifest(files)
+    n_frames = len(manifest)
     half_w = args.window // 2 if use_rolling_median else 0
-    
+
     if args.verbose:
-        print(f"Found {n_frames} frames")
+        print(f"Found {len(files)} FITS file(s) containing {n_frames} total frame(s)")
         if use_rolling_median:
             print(f"Reference method: rolling median (window={args.window})")
         else:
@@ -209,20 +265,16 @@ def main():
     if use_rolling_median:
         # Initialize rolling window buffer
         window_buffer = deque(maxlen=2 * half_w + 1)
-        
-        # old_med_filter_frame = None
 
         for i in range(n_frames):
-            frame, header = load_frame(files[i])
+            file_path, frame_idx, output_name = manifest[i]
+            frame, header = load_frame(file_path, frame_idx)
             window_buffer.append(frame)
 
             center_idx = i - half_w
-            # if i == 2 * half_w - 1:
-            #     # continue
-            #     old_med_filter_frame = convolve(window_buffer[half_w] - med_bias, kernel)
             if i < 2 * half_w or i >= n_frames:
                 continue
-            
+
             center_frame = window_buffer[half_w]
             # Mask out non-RTN pixels in buffer for reference calculation for speed.
             # Also exclude the center frame to avoid self-biasing.
@@ -230,40 +282,41 @@ def main():
             masked_buffer = np.asarray(window_buffer)[mask] * rtn_mask[np.newaxis, :, :]
             reference = np.median(masked_buffer, axis=0)
             std_reference = np.std(masked_buffer, axis=0)
-            
+
             corrected, num_corr_arr = _correct_frame(
                 center_frame, reference, rtn_mask,
                 delta_x_arr_e, mu_e, sigma_r_arr,
                 e_per_adu, num_corr_arr, read_noise_frame, std_reference,
             )
-            # old_med_filter_frame = new_med_filter_frame
 
-            _, center_header = load_frame(files[center_idx])
+            center_file, center_frame_idx, center_output_name = manifest[center_idx]
+            _, center_header = load_frame(center_file, center_frame_idx)
             center_header['RTNCORR'] = True
             center_header['RTNWIN'] = args.window
             center_header['RTNREF'] = 'rolling_median'
-            
-            out_path = out_folder / files[center_idx].name
+
+            out_path = out_folder / center_output_name
             fits.writeto(out_path, corrected.astype(np.int16), center_header, overwrite=True)
-            
+
             if args.verbose:
-                print(f"Corrected {center_idx + 1}/{n_frames}: {files[center_idx].name}")
+                print(f"Corrected {center_idx + 1}/{n_frames}: {center_output_name}")
 
         # Copy edge frames uncorrected
         for i in list(range(half_w)) + list(range(n_frames - half_w, n_frames)):
-            frame, header = load_frame(files[i])
+            file_path, frame_idx, output_name = manifest[i]
+            frame, header = load_frame(file_path, frame_idx)
             header['RTNCORR'] = False
-            out_path = out_folder / files[i].name
+            out_path = out_folder / output_name
             fits.writeto(out_path, frame.astype(np.int16), header, overwrite=True)
             if args.verbose:
-                print(f"Copied (edge) {i + 1}/{n_frames}: {files[i].name}")
+                print(f"Copied (edge) {i + 1}/{n_frames}: {output_name}")
 
     else:  # median_filter
-        for i, fpath in enumerate(files):
-            frame, header = load_frame(fpath)
-            
+        for i, (file_path, frame_idx, output_name) in enumerate(manifest):
+            frame, header = load_frame(file_path, frame_idx)
+
             reference = median_filter(frame, size=args.median_size)
-            
+
             corrected, num_corr_arr = _correct_frame(
                 frame, reference, rtn_mask,
                 delta_x_arr_e, mu_e, sigma_r_arr,
@@ -273,18 +326,18 @@ def main():
             header['RTNCORR'] = True
             header['RTNREF'] = 'median_filter'
             header['RTNMEDSZ'] = args.median_size
-            
-            out_path = out_folder / fpath.name
+
+            out_path = out_folder / output_name
             fits.writeto(out_path, corrected.astype(np.int16), header, overwrite=True)
-            
+
             if args.verbose:
-                print(f"Corrected {i + 1}/{n_frames}: {fpath.name}")
+                print(f"Corrected {i + 1}/{n_frames}: {output_name}")
 
     print(f"Done. Processed {n_frames} frames.")
-    frac_high_corrections = num_corr_arr[1] / len(files) / (1 - rtn_params[1] - rtn_params[2])
-    frac_low_corrections = num_corr_arr[0] / len(files) / rtn_params[2]
+    frac_high_corrections = num_corr_arr[1] / n_frames / (1 - rtn_params[1] - rtn_params[2])
+    frac_low_corrections = num_corr_arr[0] / n_frames / rtn_params[2]
     print(np.median(frac_high_corrections[rtn_mask]), np.median(frac_low_corrections[rtn_mask]))
-    updated_bias_frame = old_mean_bias + np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / len(files)
+    updated_bias_frame = old_mean_bias + np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
     # new_mean_bias = (rtn_params[0] * (rtn_params[1] + frac_high_corrections * (1 - rtn_params[1] - rtn_params[2]) + frac_low_corrections * rtn_params[2]) +
     #                 (rtn_params[0] - rtn_params[3]) * rtn_params[2] * (1 - frac_low_corrections) +
     #                 (rtn_params[0] + rtn_params[3]) * (1 - rtn_params[1] - rtn_params[2]) * (1 - frac_high_corrections))
