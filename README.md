@@ -109,6 +109,7 @@ python rtn_fixer.py <params_folder> <input_folder> <gain> [options]
 | Option | Description |
 |---|---|
 | `-o`, `--output` | Output folder for corrected frames (default: `./corrected/`) |
+| `--frames N` | Number of frames to process (default: all available) |
 | `-v`, `--verbose` | Print per-frame progress |
 
 **Example with sample data (rolling temporal median):**
@@ -128,7 +129,7 @@ python rtn_fixer.py "Sample Data/bias_cutouts/rtn_fits_output" "Sample Data/scie
 | File/Folder | Description |
 |---|---|
 | `<output>/*.fits` | Corrected science frames (int16), with FITS header keywords `RTNCORR`, `RTNREF`, and `RTNWIN` or `RTNMEDSZ` recording the correction metadata |
-| `<output>/updated_bias_frame/updated_bias_frame.fits` | Updated mean bias frame accounting for the net effect of RTN corrections applied |
+| `<output>/correction_values_frame/correction_values_frame.fits` | Correction values accounting for the net effect of RTN corrections applied |
 
 **Reference method guidance:**
 

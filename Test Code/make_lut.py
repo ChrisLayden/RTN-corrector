@@ -125,8 +125,7 @@ class ThresholdLUT:
         # delta_x_min = central_high - lam, so lambda_max is where delta_x = central_high - lam
         # i.e., lam = central_high - delta_x
         # We need to find lam where central_high(lam, rn) - lam = delta_x
-        # Clip read noise points to avoid extrapolation issues
-        read_noise = np.clip(read_noise, self.rn_vals[0], self.rn_vals[-1])
+        
         pts = np.column_stack([self.lam_vals, np.full_like(self.lam_vals, read_noise)])
         central_high_curve = self._interp_high(pts)
         delta_x_min_curve = central_high_curve - self.lam_vals
@@ -157,14 +156,13 @@ class ThresholdLUT:
 
 
 if __name__ == "__main__":
-    # lut = ThresholdLUT(
-    #     lam_range=np.linspace(0, 100, 200),
-    #     read_noise_range=np.linspace(0.1, 10.0, 200),
-    #     alpha=0.01
-    # )
-    # lut.save('rts_threshold_lut_alpha_01.pkl')
-    lut = ThresholdLUT.load('rts_threshold_lut.pkl')
+    lut = ThresholdLUT(
+        lam_range=np.linspace(0, 100, 200),
+        read_noise_range=np.linspace(0.1, 10.0, 200),
+        alpha=0.005
+    )
+    lut.save('rts_threshold_lut_alpha_005.pkl')
 
     print("Central thresholds:", lut.get_central_thresholds(lam=5, read_noise=1.5))
     print("Peak thresholds:", lut.get_peak_thresholds(lam=5, read_noise=1.5, delta_x=10))
-    print("Lambda max:", lut.get_lambda_max(read_noise=0.1, delta_x=10))
+    print("Lambda max:", lut.get_lambda_max(read_noise=1.5, delta_x=10))

@@ -3,8 +3,8 @@
 Apply RTN correction to a stack of frames.
 
 Usage:
-    python correct_rtn.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -w 10
-    python correct_rtn.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -m 3
+    python rtn_fixer.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -w 10
+    python rtn_fixer.py rtn_params.fits ./frames/ 0.5 -o ./corrected/ -m 3
 """
 import os
 import argparse
@@ -134,13 +134,19 @@ def get_fits_files(folder):
     return files
 
 
-def build_frame_manifest(files):
+def build_frame_manifest(files, max_frames=None):
     """
-    Build a manifest of all frames across files.
-    Returns: list of (file_path, frame_index, output_name) tuples
+    Build a manifest of frames across files.
+
+    Args:
+        files: List of FITS file paths
+        max_frames: Maximum number of frames to include (None = all frames)
+
+    Returns:
+        list of (file_path, frame_index, output_name) tuples
     """
     manifest = []
-    frame_counter = 0
+    frame_count = 0
 
     for file_path in files:
         with fits.open(file_path) as hdul:
@@ -149,7 +155,7 @@ def build_frame_manifest(files):
             if len(data_shape) == 2:
                 # Single 2D frame
                 manifest.append((file_path, None, file_path.name))
-                frame_counter += 1
+                frame_count += 1
             elif len(data_shape) == 3:
                 # 3D cube - each slice is a separate frame
                 n_frames = data_shape[0]
@@ -158,9 +164,16 @@ def build_frame_manifest(files):
                 for i in range(n_frames):
                     output_name = f"{base_name}_frame{i:04d}{ext}"
                     manifest.append((file_path, i, output_name))
-                    frame_counter += 1
+                    frame_count += 1
+                    # Stop if we've reached the frame limit
+                    if max_frames is not None and frame_count >= max_frames:
+                        break
             else:
                 raise ValueError(f"Unexpected data shape {data_shape} in {file_path}. Expected 2D or 3D arrays.")
+
+        # Stop if we've reached the frame limit
+        if max_frames is not None and frame_count >= max_frames:
+            break
 
     return manifest
 
@@ -177,13 +190,12 @@ def load_frame(path, frame_index=None):
         frame: 2D numpy array
         header: FITS header
     """
-    with fits.open(path, memmap=True) as hdul:
+    with fits.open(path) as hdul:
         data = hdul[0].data
         header = hdul[0].header.copy()
 
         if frame_index is not None:
             # Extract specific frame from cube
-            # Memory mapping allows loading only this slice without reading the entire cube
             frame = data[frame_index].astype(np.float64)
             # Add cube frame info to header
             header['CUBEIDX'] = frame_index
@@ -200,12 +212,14 @@ def main():
     parser.add_argument('params_folder', help='Path to folder containing rtn_params.fits and median_bias_frame.fits')
     parser.add_argument('input_folder', help='Folder containing FITS frames')
     parser.add_argument('gain', type=float, help='Sensor gain in ADU/e-')
-    parser.add_argument('-o', '--output', default='./corrected/',
-                        help='Output folder (default: ./corrected/)')
+    parser.add_argument('-o', '--output', default=None,
+                        help='Output folder (default: input_folder/corrected/)')
     parser.add_argument('-w', '--window', type=int, default=None,
                         help='Rolling median window size (temporal)')
     parser.add_argument('-m', '--median-size', type=int, default=None,
                         help='Median filter kernel size (spatial)')
+    parser.add_argument('--frames', type=int, default=None,
+                        help='Number of frames to process (default: all available)')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -237,14 +251,22 @@ def main():
 
     use_rolling_median = args.window is not None
 
-    # Get file list and build frame manifest
+    # Get file list and build frame manifest (only up to max_frames if specified)
     files = get_fits_files(args.input_folder)
-    manifest = build_frame_manifest(files)
+    manifest = build_frame_manifest(files, max_frames=args.frames)
     n_frames = len(manifest)
+
+    if args.verbose:
+        if args.frames is None:
+            print(f"Found {len(files)} FITS file(s) containing {n_frames} total frame(s)")
+            print(f"Processing all {n_frames} frames")
+        else:
+            print(f"Found at least {n_frames} frame(s) in the input files")
+            print(f"Processing first {n_frames} frames")
+
     half_w = args.window // 2 if use_rolling_median else 0
 
     if args.verbose:
-        print(f"Found {len(files)} FITS file(s) containing {n_frames} total frame(s)")
         if use_rolling_median:
             print(f"Reference method: rolling median (window={args.window})")
         else:
@@ -259,7 +281,7 @@ def main():
                        sigma_r_arr[:10, :10],
                        e_per_adu, num_corr_arr[:, :10, :10], read_noise_frame[:10, :10])
 
-    out_folder = Path(args.output)
+    out_folder = Path(args.output) if args.output is not None else Path(args.input_folder) / "corrected"
     out_folder.mkdir(parents=True, exist_ok=True)
 
     if use_rolling_median:
@@ -312,7 +334,8 @@ def main():
                 print(f"Copied (edge) {i + 1}/{n_frames}: {output_name}")
 
     else:  # median_filter
-        for i, (file_path, frame_idx, output_name) in enumerate(manifest):
+        for i in range(n_frames):
+            file_path, frame_idx, output_name = manifest[i]
             frame, header = load_frame(file_path, frame_idx)
 
             reference = median_filter(frame, size=args.median_size)
@@ -338,9 +361,11 @@ def main():
     frac_low_corrections = num_corr_arr[0] / n_frames / rtn_params[2]
     print(np.median(frac_high_corrections[rtn_mask]), np.median(frac_low_corrections[rtn_mask]))
     updated_bias_frame = old_mean_bias + np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
+    correction_values = np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
     # new_mean_bias = (rtn_params[0] * (rtn_params[1] + frac_high_corrections * (1 - rtn_params[1] - rtn_params[2]) + frac_low_corrections * rtn_params[2]) +
     #                 (rtn_params[0] - rtn_params[3]) * rtn_params[2] * (1 - frac_low_corrections) +
     #                 (rtn_params[0] + rtn_params[3]) * (1 - rtn_params[1] - rtn_params[2]) * (1 - frac_high_corrections))
+    # updated_bias_frame = old_mean_bias * (1 - rtn_mask) + np.nan_to_num(new_mean_bias * rtn_mask / e_per_adu)
     # import matplotlib.pyplot as plt
     # plt.hist(frac_high_corrections.flatten(), bins=50, alpha=0.5, label='High-level corrections', range=(0, 2))
     # plt.hist(frac_low_corrections.flatten(), bins=50, alpha=0.5, label='Low-level corrections', range=(0, 2))
@@ -349,12 +374,15 @@ def main():
     # plt.legend()
     # plt.show()
     # print(np.nanmedian(frac_high_corrections), np.nanmedian(frac_low_corrections))
-    print(np.mean(updated_bias_frame[rtn_mask] - old_mean_bias[rtn_mask]))
-    print(np.mean(updated_bias_frame[~rtn_mask] - old_mean_bias[~rtn_mask]))
+    print(np.mean(correction_values[rtn_mask]))
+    # print(np.mean(updated_bias_frame[~rtn_mask] - old_mean_bias[~rtn_mask]))
     # Make a new folder in the output folder for the updated bias frame
-    updated_bias_folder = out_folder / 'updated_bias_frame'
-    updated_bias_folder.mkdir(exist_ok=True)
-    fits.writeto(updated_bias_folder / 'updated_bias_frame.fits', updated_bias_frame.astype(np.float32), overwrite=True)
+    # updated_bias_folder = out_folder / 'updated_bias_frame'
+    # updated_bias_folder.mkdir(exist_ok=True)
+    # fits.writeto(updated_bias_folder / 'updated_bias_frame.fits', updated_bias_frame.astype(np.float32), overwrite=True)
+    correction_values_folder = out_folder / 'correction_values_frame'
+    correction_values_folder.mkdir(exist_ok=True)
+    fits.writeto(correction_values_folder / 'correction_values_frame.fits', correction_values.astype(np.float32), overwrite=True)
 
 
 if __name__ == '__main__':
