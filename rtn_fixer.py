@@ -236,7 +236,9 @@ def main():
     # Pre-compute constants
     e_per_adu = 1.0 / args.gain
     rtn_mask = ~np.isnan(rtn_params[0])
-    print(np.sum(rtn_mask), "RTN pixels detected.")
+    n_rtn = int(np.sum(rtn_mask))
+    print(n_rtn, "RTN pixels detected.")
+    rtn_flat_idx = np.flatnonzero(rtn_mask)
     delta_x_arr_e = np.ascontiguousarray(rtn_params[3], dtype=np.float64)
     mu_e = np.ascontiguousarray(rtn_params[0], dtype=np.float64)
     sigma_r_arr = np.ascontiguousarray(rtn_params[4], dtype=np.float64)
@@ -285,25 +287,43 @@ def main():
     out_folder.mkdir(parents=True, exist_ok=True)
 
     if use_rolling_median:
-        # Initialize rolling window buffer
-        window_buffer = deque(maxlen=2 * half_w + 1)
+        window_size = 2 * half_w + 1
+
+        # Pre-allocated ring buffer: only RTN pixel values, shape (window_size, n_rtn)
+        ring_buffer = np.zeros((window_size, n_rtn), dtype=np.float64)
+        # Deque of full frames needed for center frame output and correction
+        frame_buffer = deque(maxlen=window_size)
+        ring_pos = 0
 
         for i in range(n_frames):
             file_path, frame_idx, output_name = manifest[i]
             frame, header = load_frame(file_path, frame_idx)
-            window_buffer.append(frame)
+
+            # Extract RTN pixels into ring buffer slot
+            ring_buffer[ring_pos % window_size] = frame.ravel()[rtn_flat_idx]
+            ring_pos += 1
+            frame_buffer.append(frame)
 
             center_idx = i - half_w
             if i < 2 * half_w or i >= n_frames:
                 continue
 
-            center_frame = window_buffer[half_w]
-            # Mask out non-RTN pixels in buffer for reference calculation for speed.
-            # Also exclude the center frame to avoid self-biasing.
-            mask = np.arange(len(window_buffer)) != half_w
-            masked_buffer = np.asarray(window_buffer)[mask] * rtn_mask[np.newaxis, :, :]
-            reference = np.median(masked_buffer, axis=0)
-            std_reference = np.std(masked_buffer, axis=0)
+            center_frame = frame_buffer[half_w]
+
+            # Compute median and std only at RTN pixel locations,
+            # excluding the center frame to avoid self-bias
+            center_ring_idx = (ring_pos - 1 - half_w) % window_size
+            other_indices = [j for j in range(window_size) if j != center_ring_idx]
+            window_data = ring_buffer[other_indices]  # (window_size-1, n_rtn)
+            ref_rtn = np.median(window_data, axis=0)
+            std_rtn = np.std(window_data, axis=0)
+
+            # Scatter sparse results into full-size arrays for _correct_frame.
+            # Only RTN locations matter; the kernel skips all others via rtn_mask.
+            reference = np.zeros_like(center_frame)
+            reference.ravel()[rtn_flat_idx] = ref_rtn
+            std_reference = np.zeros_like(center_frame)
+            std_reference.ravel()[rtn_flat_idx] = std_rtn
 
             corrected, num_corr_arr = _correct_frame(
                 center_frame, reference, rtn_mask,
