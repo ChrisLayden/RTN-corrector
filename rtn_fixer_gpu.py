@@ -2,6 +2,10 @@
 """
 GPU-accelerated RTN correction using CuPy.
 
+Optimizations over naive GPU port:
+  - Sparse dispatch: correction kernel only runs on RTN pixels (~1-5% of sensor)
+  - Rolling median computed only at RTN pixel locations with pre-allocated ring buffer
+
 Usage:
     python rtn_fixer_gpu.py ./params_folder/ ./frames/ 0.5 -o ./corrected/ -w 10
     python rtn_fixer_gpu.py ./params_folder/ ./frames/ 0.5 -o ./corrected/ -m 3
@@ -23,12 +27,12 @@ rn_vals = lut.rn_vals
 central_low_data = lut.central_low
 central_high_data = lut.central_high
 
-# GPU kernel matching the CPU _correct_frame logic exactly.
+# GPU kernel operating on sparse RTN pixels only.
+# All inputs are 1D arrays of length n_rtn (the number of RTN pixels).
 # When use_std_ref == 0, the std_reference check is skipped.
-_correct_frame_kernel = cp.ElementwiseKernel(
+_correct_sparse_kernel = cp.ElementwiseKernel(
     in_params='''
         float64 frame_val, float64 ref_val, float64 std_ref_val,
-        bool rtn_mask_val,
         float64 delta_x, float64 mu, float64 sigma_r, float64 read_noise,
         float64 e_per_adu, int32 use_std_ref,
         raw float64 lam_arr, raw float64 rn_arr,
@@ -40,8 +44,6 @@ _correct_frame_kernel = cp.ElementwiseKernel(
         corrected = frame_val;
         corr_type = 0;  // 0 = none, 1 = low-peak (+delta), 2 = high-peak (-delta)
 
-        if (!rtn_mask_val) return;
-
         // Compute lambda (expected signal in electrons)
         double lam = ref_val * e_per_adu - mu;
         if (lam < 0.0) lam = 0.0;
@@ -50,7 +52,9 @@ _correct_frame_kernel = cp.ElementwiseKernel(
         if (use_std_ref) {
             double std_e = std_ref_val * e_per_adu;
             double expected_std = 1.5 * sqrt(lam + read_noise * read_noise);
-            if (std_e > expected_std) return;
+            if (std_e > expected_std) {
+                return;
+            }
         }
 
         // Bilinear interpolation indices for lambda
@@ -77,7 +81,7 @@ _correct_frame_kernel = cp.ElementwiseKernel(
         if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
         if (u_w < 0.0) u_w = 0.0; if (u_w > 1.0) u_w = 1.0;
 
-        // 2D grid indices
+        // 2D grid indices into flattened LUT
         int idx00 = il * n_rn + jr;
         int idx01 = il * n_rn + (jr + 1);
         int idx10 = (il + 1) * n_rn + jr;
@@ -94,7 +98,7 @@ _correct_frame_kernel = cp.ElementwiseKernel(
                              + ch_data[idx11] * t * u_w;
 
         // Check for NaN (out of LUT bounds)
-        if (central_low != central_low) return;  // NaN check
+        if (central_low != central_low) return;
 
         // Compute peak thresholds
         double high_peak_high = central_high + delta_x;
@@ -109,18 +113,16 @@ _correct_frame_kernel = cp.ElementwiseKernel(
         double diff = frame_val * e_per_adu - mu;
 
         if (diff > high_peak_low && diff < high_peak_high) {
-            // Check overlap
             if (high_peak_low >= delta_x) return;
             corrected = frame_val + round(-delta_x / e_per_adu);
             corr_type = 2;
         } else if ((diff + lam) < low_peak_high && (diff + lam) > low_peak_low) {
-            // Check overlap
             if (low_peak_high <= -delta_x) return;
             corrected = frame_val + round(delta_x / e_per_adu);
             corr_type = 1;
         }
     ''',
-    name='correct_frame_gpu'
+    name='correct_sparse_gpu'
 )
 
 
@@ -238,20 +240,23 @@ def main():
     # Pre-compute constants
     e_per_adu = 1.0 / args.gain
     rtn_mask = ~np.isnan(rtn_params[0])
-    print(np.sum(rtn_mask), "RTN pixels detected.")
+    n_rtn = int(np.sum(rtn_mask))
+    print(f"{n_rtn} RTN pixels detected.")
 
-    # rtn_params are already in electron units from the fitter
+    # Flat indices of RTN pixels for sparse gather/scatter
+    rtn_flat_idx = np.flatnonzero(rtn_mask)
+    rtn_flat_idx_gpu = cp.asarray(rtn_flat_idx)
+
+    # Pre-gather per-RTN-pixel parameters (1D arrays, length n_rtn)
     delta_x_arr_e = np.ascontiguousarray(rtn_params[3], dtype=np.float64)
     mu_e = np.ascontiguousarray(rtn_params[0], dtype=np.float64)
     sigma_r_arr = np.ascontiguousarray(rtn_params[4], dtype=np.float64)
     read_noise_frame = np.ascontiguousarray(read_noise_frame, dtype=np.float64)
 
-    # Transfer arrays to GPU
-    rtn_mask_gpu = cp.asarray(rtn_mask)
-    delta_x_gpu = cp.asarray(delta_x_arr_e)
-    mu_gpu = cp.asarray(mu_e)
-    sigma_r_gpu = cp.asarray(sigma_r_arr)
-    read_noise_gpu = cp.asarray(read_noise_frame)
+    delta_x_rtn_gpu = cp.asarray(delta_x_arr_e.ravel()[rtn_flat_idx])
+    mu_rtn_gpu = cp.asarray(mu_e.ravel()[rtn_flat_idx])
+    sigma_r_rtn_gpu = cp.asarray(sigma_r_arr.ravel()[rtn_flat_idx])
+    read_noise_rtn_gpu = cp.asarray(read_noise_frame.ravel()[rtn_flat_idx])
 
     # Transfer LUT to GPU (flattened for raw access in kernel)
     lam_vals_gpu = cp.asarray(lam_vals, dtype=cp.float64)
@@ -259,11 +264,11 @@ def main():
     central_low_gpu = cp.asarray(central_low_data.ravel(), dtype=cp.float64)
     central_high_gpu = cp.asarray(central_high_data.ravel(), dtype=cp.float64)
     n_lam = np.int32(len(lam_vals))
-    n_rn = np.int32(len(rn_vals))
+    n_rn_lut = np.int32(len(rn_vals))
 
-    # Correction counters on GPU
-    num_corr_low_gpu = cp.zeros(rtn_mask.shape, dtype=cp.int32)
-    num_corr_high_gpu = cp.zeros(rtn_mask.shape, dtype=cp.int32)
+    # Correction counters — sparse (n_rtn,), scattered back to full 2D at the end
+    num_corr_low_rtn_gpu = cp.zeros(n_rtn, dtype=cp.int32)
+    num_corr_high_rtn_gpu = cp.zeros(n_rtn, dtype=cp.int32)
 
     # Get file list and build frame manifest
     files = get_fits_files(args.input_folder)
@@ -286,48 +291,71 @@ def main():
     out_folder = Path(args.output) if args.output is not None else Path(args.input_folder) / "corrected"
     out_folder.mkdir(parents=True, exist_ok=True)
 
-    # Helper to run the GPU correction kernel and accumulate stats
-    def correct_on_gpu(frame_gpu, reference_gpu, std_reference_gpu=None):
-        use_std = np.int32(1 if std_reference_gpu is not None else 0)
-        if std_reference_gpu is None:
-            std_reference_gpu = cp.zeros_like(frame_gpu)
+    # Helper: run sparse correction kernel and accumulate stats
+    def correct_sparse(frame_rtn_gpu, ref_rtn_gpu, std_rtn_gpu=None):
+        use_std = np.int32(1 if std_rtn_gpu is not None else 0)
+        if std_rtn_gpu is None:
+            std_rtn_gpu = cp.zeros(n_rtn, dtype=cp.float64)
 
-        corrected_gpu, corr_type = _correct_frame_kernel(
-            frame_gpu, reference_gpu, std_reference_gpu,
-            rtn_mask_gpu,
-            delta_x_gpu, mu_gpu, sigma_r_gpu, read_noise_gpu,
+        corrected_rtn, corr_type = _correct_sparse_kernel(
+            frame_rtn_gpu, ref_rtn_gpu, std_rtn_gpu,
+            delta_x_rtn_gpu, mu_rtn_gpu, sigma_r_rtn_gpu, read_noise_rtn_gpu,
             e_per_adu, use_std,
             lam_vals_gpu, rn_vals_gpu,
             central_low_gpu, central_high_gpu,
-            n_lam, n_rn
+            n_lam, n_rn_lut
         )
-        num_corr_low_gpu[...] += (corr_type == 1).astype(cp.int32)
-        num_corr_high_gpu[...] += (corr_type == 2).astype(cp.int32)
+        num_corr_low_rtn_gpu[...] += (corr_type == 1).astype(cp.int32)
+        num_corr_high_rtn_gpu[...] += (corr_type == 2).astype(cp.int32)
+        return corrected_rtn
+
+    # Helper: scatter sparse corrections back into full frame on GPU
+    def scatter_to_frame(frame_gpu, corrected_rtn_gpu):
+        corrected_gpu = frame_gpu.copy()
+        corrected_gpu.ravel()[rtn_flat_idx_gpu] = corrected_rtn_gpu
         return corrected_gpu
 
     if use_rolling_median:
-        # Initialize rolling window buffer (GPU arrays)
-        window_buffer = deque(maxlen=2 * half_w + 1)
+        window_size = 2 * half_w + 1
+
+        # Pre-allocated ring buffer: only RTN pixel values, shape (window_size, n_rtn)
+        ring_buffer_gpu = cp.zeros((window_size, n_rtn), dtype=cp.float64)
+        # Deque of full frames (GPU) needed for writing uncorrected output and
+        # for the full-frame scatter at correction time
+        frame_buffer = deque(maxlen=window_size)
+        ring_pos = 0  # current write position in ring buffer
 
         for i in range(n_frames):
             file_path, frame_idx, output_name = manifest[i]
             frame, header = load_frame(file_path, frame_idx)
             frame_gpu = cp.asarray(frame)
-            window_buffer.append(frame_gpu)
+
+            # Extract RTN pixels and write into ring buffer slot
+            frame_rtn = frame_gpu.ravel()[rtn_flat_idx_gpu]
+            ring_buffer_gpu[ring_pos % window_size] = frame_rtn
+            ring_pos += 1
+            frame_buffer.append(frame_gpu)
 
             center_idx = i - half_w
             if i < 2 * half_w or i >= n_frames:
                 continue
 
-            center_frame_gpu = window_buffer[half_w]
-            # Mask out non-RTN pixels for speed; exclude center frame to avoid self-bias
-            mask_indices = [j for j in range(len(window_buffer)) if j != half_w]
-            stacked = cp.stack([window_buffer[j] for j in mask_indices])
-            masked_buffer = stacked * rtn_mask_gpu[cp.newaxis, :, :]
-            reference_gpu = cp.median(masked_buffer, axis=0)
-            std_reference_gpu = cp.std(masked_buffer, axis=0)
+            center_frame_gpu = frame_buffer[half_w]
 
-            corrected_gpu = correct_on_gpu(center_frame_gpu, reference_gpu, std_reference_gpu)
+            # Compute median and std over the ring buffer, excluding the center slot
+            center_ring_idx = (ring_pos - 1 - half_w) % window_size
+            # Gather all slots except center into a contiguous array
+            other_indices = [j for j in range(window_size) if j != center_ring_idx]
+            window_data = ring_buffer_gpu[other_indices]  # shape: (window_size-1, n_rtn)
+            ref_rtn_gpu = cp.median(window_data, axis=0)
+            std_rtn_gpu = cp.std(window_data, axis=0)
+
+            # Run sparse correction
+            frame_rtn_gpu = center_frame_gpu.ravel()[rtn_flat_idx_gpu]
+            corrected_rtn_gpu = correct_sparse(frame_rtn_gpu, ref_rtn_gpu, std_rtn_gpu)
+
+            # Scatter back into full frame
+            corrected_gpu = scatter_to_frame(center_frame_gpu, corrected_rtn_gpu)
             corrected = cp.asnumpy(corrected_gpu)
 
             center_file, center_frame_idx, center_output_name = manifest[center_idx]
@@ -358,9 +386,16 @@ def main():
             frame, header = load_frame(file_path, frame_idx)
             frame_gpu = cp.asarray(frame)
 
+            # Spatial median filter needs the full frame for neighborhood context
             reference_gpu = gpu_median_filter(frame_gpu, size=args.median_size)
 
-            corrected_gpu = correct_on_gpu(frame_gpu, reference_gpu)
+            # Gather RTN pixels from frame and reference
+            frame_rtn_gpu = frame_gpu.ravel()[rtn_flat_idx_gpu]
+            ref_rtn_gpu = reference_gpu.ravel()[rtn_flat_idx_gpu]
+
+            corrected_rtn_gpu = correct_sparse(frame_rtn_gpu, ref_rtn_gpu)
+
+            corrected_gpu = scatter_to_frame(frame_gpu, corrected_rtn_gpu)
             corrected = cp.asnumpy(corrected_gpu)
 
             header['RTNCORR'] = True
@@ -375,11 +410,15 @@ def main():
 
     print(f"Done. Processed {n_frames} frames.")
 
-    # Statistics (transfer back to CPU)
-    num_corr_arr = np.stack([cp.asnumpy(num_corr_low_gpu), cp.asnumpy(num_corr_high_gpu)])
+    # Scatter sparse correction counts back to full 2D for statistics
+    num_corr_arr = np.zeros((2, *rtn_mask.shape), dtype=np.int32)
+    num_corr_arr[0].ravel()[rtn_flat_idx] = cp.asnumpy(num_corr_low_rtn_gpu)
+    num_corr_arr[1].ravel()[rtn_flat_idx] = cp.asnumpy(num_corr_high_rtn_gpu)
+
     frac_high_corrections = num_corr_arr[1] / n_frames / (1 - rtn_params[1] - rtn_params[2])
     frac_low_corrections = num_corr_arr[0] / n_frames / rtn_params[2]
     print(np.median(frac_high_corrections[rtn_mask]), np.median(frac_low_corrections[rtn_mask]))
+    updated_bias_frame = old_mean_bias + np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
     correction_values = np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
     print(np.mean(correction_values[rtn_mask]))
     correction_values_folder = out_folder / 'correction_values_frame'
