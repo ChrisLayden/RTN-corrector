@@ -11,10 +11,13 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 import copy
 import time
+import resource
 import os
 from glob import glob
 from numba import njit
 from scripts.make_lut import ThresholdLUT
+import multiprocessing
+from fitsreader import FITSReader
 
 def sigma_clip(data, sigma=10, max_iters=5, clip_val='mean'):
     clipped_data = copy.deepcopy(data)
@@ -222,7 +225,9 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                 A_err = errs[1] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized A
                 B1_err = errs[2] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized B1
                 B2_err = errs[3] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized B2
-                bad_fit_checks = abs(popt / errs) < 3
+                # Suppress division by zero warnings
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    bad_fit_checks = abs(popt / errs) < 3
                 # Allow for one of the side peaks to be poorly fit if consistent with zero
                 if abs(B1_fit) < 0.03 and bad_fit_checks[2]:
                     bad_fit_checks[2] = False
@@ -395,11 +400,8 @@ def get_new_read_noise(read_noise_arr, rtn_params_arr, plot=False, save_path=Non
             plt.close()
     return flux_values, new_read_noise_vals
 
-def get_bias_stack_info(folder, frames_to_keep=None):
+def get_bias_stack_info(fits_files, frames_to_keep=None):
     """Get frame count and sensor shape without loading pixel data."""
-    fits_files = sorted(glob(os.path.join(folder, '*.fits')) + glob(os.path.join(folder, '*.fit')))
-    if not fits_files:
-        raise FileNotFoundError(f"No FITS files found in {folder}")
 
     total_frames = 0
     frame_shape_2d = None
@@ -407,7 +409,7 @@ def get_bias_stack_info(folder, frames_to_keep=None):
 
     for file in fits_files:
         with fits.open(file) as hdul:
-            data_shape = hdul[0].data.shape
+            data_shape = hdul[0].shape
             if len(data_shape) == 2:
                 file_frame_counts.append(1)
                 total_frames += 1
@@ -430,77 +432,62 @@ def get_bias_stack_info(folder, frames_to_keep=None):
         n_frames = frames_to_keep
 
     print(f"Bias stack info: {n_frames} frames, sensor shape {frame_shape_2d}")
-    return n_frames, frame_shape_2d, fits_files
+    return n_frames, frame_shape_2d
 
 
-def load_bias_stack_slice(folder, row_start, row_end, frames_to_keep=None, fits_files=None):
+def get_reader(fits_files, nparallel):
+    # Try to ensure we can have enough open file handles
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    nfhandles = max(soft, nparallel * len(fits_files) + 10)
+    if hard < nfhandles:
+        hard = nfhandles
+    resource.setrlimit(resource.RLIMIT_NOFILE, (nfhandles, hard))
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    ptsgen = FITSReader(fits_files)
+    return ptsgen
+
+
+def load_bias_stack_slice(ptsgen, row_start, row_end, frames_to_keep=None):
     """Load all frames but only for rows [row_start:row_end].
 
     Returns array of shape (n_frames, row_end - row_start, n_cols).
     """
-    if fits_files is None:
-        fits_files = sorted(glob(os.path.join(folder, '*.fits')) + glob(os.path.join(folder, '*.fit')))
-    if not fits_files:
-        raise FileNotFoundError(f"No FITS files found in {folder}")
-
-    # First pass: count frames
-    total_frames = 0
-    for file in fits_files:
-        with fits.open(file) as hdul:
-            data_shape = hdul[0].data.shape
-            if len(data_shape) == 2:
-                total_frames += 1
-                n_cols = data_shape[1]
-            elif len(data_shape) == 3:
-                total_frames += data_shape[0]
-                n_cols = data_shape[2]
-        if frames_to_keep is not None and total_frames >= frames_to_keep:
-            break
-
-    if frames_to_keep is None or frames_to_keep > total_frames:
-        frames_to_keep = total_frames
-
-    slice_rows = row_end - row_start
-    bias_slice = np.zeros((frames_to_keep, slice_rows, n_cols), dtype=np.int32)
-
-    # Second pass: load only the row slice from each frame
-    frame_idx = 0
-    for file in fits_files:
-        if frame_idx >= frames_to_keep:
-            break
-        with fits.open(file) as hdul:
-            data = hdul[0].data
-            if len(data.shape) == 2:
-                bias_slice[frame_idx] = data[row_start:row_end].astype(np.int32)
-                frame_idx += 1
-            else:
-                n_frames_in_cube = data.shape[0]
-                frames_to_load = min(n_frames_in_cube, frames_to_keep - frame_idx)
-                bias_slice[frame_idx:frame_idx + frames_to_load] = data[:frames_to_load, row_start:row_end].astype(np.int32)
-                frame_idx += frames_to_load
-
-    return bias_slice
+    return ptsgen.get_rows(row_start, row_end, frames_to_keep=frames_to_keep)
 
 
-def load_bias_stack(folder, frames_to_keep=None):
-    """Load full bias stack into memory (original behavior)."""
-    n_frames, frame_shape_2d, fits_files = get_bias_stack_info(folder, frames_to_keep)
-    return load_bias_stack_slice(folder, 0, frame_shape_2d[0],
-                                 frames_to_keep=frames_to_keep, fits_files=fits_files)
+def fit_slice(si, r0, r1, ptsgen, frames_to_keep, nonnormal_mask_full, read_noise_stats, adu, verbose):
+    slice_nonnormal = nonnormal_mask_full[r0:r1, :]
+    nonnormal_in_slice = np.sum(slice_nonnormal)
+    print(f"  Slice {si+1}: rows {r0}-{r1} ({nonnormal_in_slice} non-normal pixels)")
+    if nonnormal_in_slice == 0:
+        print(f"    No non-normal pixels in this slice, skipping.")
+        return si, None
+
+    bias_slice = load_bias_stack_slice(ptsgen, r0, r1, frames_to_keep=frames_to_keep)
+    bias_slice = np.array(bias_slice)
+    slice_params, slice_rtn_mask = fit_rtn_parameters(bias_slice, slice_nonnormal,
+                                                      read_noise_stats, adu,
+                                                      verbose=False)
+    del bias_slice
+    return si, slice_params
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description='Identify and fit RTN parameters from bias frames (sliced mode).')
-    parser.add_argument('bias_folder', type=str, help='Folder containing bias FITS files')
-    parser.add_argument('gain', type=float, nargs='?', default=None, help='Gain in ADU/e- (optional; if not provided, analysis is done in ADU units, and results are not saved.)')
+    parser.add_argument('files', type=str, nargs='+', help='Folder containing bias FITS files')
+    parser.add_argument('-g', '--gain', type=float, default=None, help='Gain in ADU/e- (optional; if not provided, analysis is done in ADU units, and results are not saved.)')
     parser.add_argument('-o', '--output', type=str, default=None,
-                        help='Output path for rtn_params.fits (default: bias_folder/rtn_fits_output/)')
+                        help='Output path for rtn_params.fits (default: ./rtn_fits_output/)')
     parser.add_argument('--frames', type=int, default=None,
                         help='Number of frames to use from bias stack (default: all available)')
-    parser.add_argument('--slice-rows', type=int, default=None,
-                        help='Number of rows per slice (default: full sensor, i.e. no slicing). '
-                             'Use this to limit RAM usage.')
-    parser.add_argument('--lut', type=str, default='rts_threshold_lut.pkl',
-                        help='Path to threshold LUT file (default: rts_threshold_lut.pkl)')
+    parser.add_argument('--slice-rows', type=int, default=1,
+                        help='Number of rows per slice (default: 1).' 'Use this to limit RAM usage.')
+    parser.add_argument('-p', '--parallel', type=int, default=os.cpu_count(), help=f'Number of processors to use (default:{os.cpu_count()}).')
+    parser.add_argument('--lut', type=str, default=os.path.join(os.path.dirname(__file__), 'rts_threshold_lut.pkl'),
+                        help='Path to threshold LUT file (default: [script_path]/rts_threshold_lut.pkl)')
     parser.add_argument('--plot', action='store_true',
                         help='Display plots (non-blocking) as the script runs')
     parser.add_argument('--save-plots', action='store_true',
@@ -508,9 +495,9 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output during fitting')
     args = parser.parse_args()
     if args.output is None:
-        output_dir = os.path.join(args.bias_folder, 'rtn_fits_output')
+        output_dir = os.path.realpath(os.path.join(os.getcwd(), 'rtn_fits_output'))
     else:
-        output_dir = os.path.dirname(args.output)
+        output_dir = os.path.realpath(args.output)
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, 'rtn_params.fits')
     plots_save_path = output_dir if args.save_plots else None
@@ -523,7 +510,8 @@ def main():
     t0 = time.time()
 
     # Get sensor dimensions without loading data
-    n_frames, (n_rows, n_cols), fits_files = get_bias_stack_info(args.bias_folder, frames_to_keep)
+    fits_files = args.files
+    n_frames, (n_rows, n_cols) = get_bias_stack_info(fits_files, frames_to_keep)
     if frames_to_keep is None or frames_to_keep > n_frames:
         frames_to_keep = n_frames
 
@@ -552,10 +540,11 @@ def main():
     # Pass 1: Compute per-pixel read noise for each slice to get the global median.
     print(f"\n=== Pass 1: Computing per-pixel read noise ({n_slices} slice(s), {frames_for_stats} frames) ===")
     t1 = time.time()
+
+    ptsgen = get_reader(fits_files, args.parallel)
     for si, (r0, r1) in enumerate(slices):
         print(f"  Slice {si+1}/{n_slices}: rows {r0}-{r1}")
-        bias_slice = load_bias_stack_slice(args.bias_folder, r0, r1,
-                                           frames_to_keep=frames_for_stats, fits_files=fits_files)
+        bias_slice = load_bias_stack_slice(ptsgen, r0, r1, frames_to_keep=frames_for_stats)
         if adu is not None:
             slice_data = bias_slice * adu
         else:
@@ -623,8 +612,7 @@ def main():
     print(f"\n=== Pass 2: Identifying non-normal pixels ({n_slices} slice(s), {frames_for_nonnormal} frames) ===")
     for si, (r0, r1) in enumerate(slices):
         print(f"  Slice {si+1}/{n_slices}: rows {r0}-{r1}")
-        bias_slice = load_bias_stack_slice(args.bias_folder, r0, r1,
-                                           frames_to_keep=frames_for_nonnormal, fits_files=fits_files)
+        bias_slice = load_bias_stack_slice(ptsgen, r0, r1, frames_to_keep=frames_for_nonnormal)
         # Run AD test on this slice
         A2 = ad_statistics_normal(bias_slice)
         slice_read_noise = read_noise_array_with_units[r0:r1, :]
@@ -664,21 +652,20 @@ def main():
     print(f"Pass 2 completed in {t3 - t2:.2f} seconds.")
 
     # Pass 3: Fit RTN parameters per slice (uses ALL frames)
+    # This can be very slow, use multiprocessing for parallel execution.
+
     print(f"\n=== Pass 3: Fitting RTN parameters ({n_slices} slice(s), {frames_to_keep} frames) ===")
-    for si, (r0, r1) in enumerate(slices):
-        nonnormal_in_slice = np.sum(nonnormal_mask_full[r0:r1, :])
-        print(f"  Slice {si+1}/{n_slices}: rows {r0}-{r1} ({nonnormal_in_slice} non-normal pixels)")
-        if nonnormal_in_slice == 0:
-            print(f"    No non-normal pixels in this slice, skipping.")
-            continue
-        bias_slice = load_bias_stack_slice(args.bias_folder, r0, r1,
-                                           frames_to_keep=frames_to_keep, fits_files=fits_files)
-        slice_nonnormal = nonnormal_mask_full[r0:r1, :]
-        slice_params, slice_rtn_mask = fit_rtn_parameters(bias_slice, slice_nonnormal,
-                                                          read_noise_stats, adu,
-                                                          verbose=args.verbose)
-        rtn_params_full[:, r0:r1, :] = slice_params
-        del bias_slice, slice_params
+
+    with multiprocessing.Pool(args.parallel) as pool:
+        results = [pool.apply_async(fit_slice,
+                   (si, r0, r1, ptsgen, frames_to_keep, nonnormal_mask_full, read_noise_stats, adu, args.verbose)) \
+                   for si, (r0, r1) in enumerate(slices)]
+        for r in results:
+            si, slice_params = r.get()
+            r0, r1 = slices[si]
+            if slice_params is not None:
+                rtn_params_full[:, r0:r1, :] = slice_params
+                del slice_params
 
     t4 = time.time()
     print(f"Pass 3 completed in {t4 - t3:.2f} seconds.")
