@@ -40,31 +40,35 @@ The `Sample Data/` folder contains cutouts for testing:
 Identifies RTN pixels from a stack of bias frames (at least 1000 recommended, 5000 is ideal) and fits their parameters.
 
 ```
-python rtn_fitter.py <bias_folder> <gain> [options]
+python rtn_fitter.py <bias_files...> -g <gain> [options]
 ```
+
+Only the rows needed for the current slice are read from disk, so the full bias stack never has to fit in memory. The fitting stage (Pass 3) runs in parallel across slices.
 
 **Arguments:**
 
 | Argument | Description |
 |---|---|
-| `bias_folder` | Path to folder containing bias FITS files (and no other FITS files). Files can be either single 2D frames or 3D data cubes. |
-| `gain` | Sensor gain in ADU/e⁻ (optional; if omitted, analysis is done in ADU units and only the read noise histogram is saved) |
+| `bias_files` | One or more bias FITS files. Files can be either single 2D frames or 3D data cubes. Shell globs work, e.g. `/path/to/bias/*.fits`. |
 
 **Options:**
 
 | Option | Description |
 |---|---|
-| `-o`, `--output` | Output directory (default: `<bias_folder>/rtn_fits_output/`) |
+| `-g`, `--gain G` | Sensor gain in ADU/e⁻ (optional; if omitted, analysis is done in ADU units and only the read noise histogram is saved) |
+| `-o`, `--output DIR` | Output directory (default: `./rtn_fits_output/`) |
 | `--frames N` | Number of bias frames to use (default: all available) |
-| `--lut PATH` | Path to threshold LUT file (default: `rts_threshold_lut.pkl`) |
+| `--slice-rows N` | Number of sensor rows loaded per slice (default: 10). Smaller values use less RAM; larger values reduce file I/O. Use at least as many slices as processes so Pass 3 runs fully in parallel. |
+| `-p`, `--parallel N` | Number of processes used for fitting in Pass 3 (default: all CPUs) |
+| `--lut PATH` | Path to threshold LUT file (default: `rts_threshold_lut.pkl` next to the script) |
 | `--plot` | Display diagnostic plots interactively as the script runs |
 | `--save-plots` | Save diagnostic plots to the output directory |
-| `-v`, `--verbose` | Print progress per column during fitting |
+| `-v`, `--verbose` | Print per-column progress during fitting (Pass 3) |
 
 **Example with sample data:**
 
 ```bash
-python rtn_fitter.py "Sample Data/bias_cutouts" 3.26 --plot --save-plots -v
+python rtn_fitter.py "Sample Data/bias_data/bias_cutouts_cube.fits" -g 3.26 --plot --save-plots -v
 ```
 
 **Outputs** (written to the output directory):
