@@ -167,4 +167,4 @@ if __name__ == "__main__":
 
     print("Central thresholds:", lut.get_central_thresholds(lam=5, read_noise=1.5))
     print("Peak thresholds:", lut.get_peak_thresholds(lam=5, read_noise=1.5, delta_x=10))
-    print("Lambda max:", lut.get_lambda_max(read_noise=0.1, delta_x=10))
+    print("Lambda max:", lut.get_lambda_max(read_noise=1.3, delta_x=9))

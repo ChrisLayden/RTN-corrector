@@ -223,16 +223,18 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                 B1_err = errs[2] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized B1
                 B2_err = errs[3] / (popt[1] + popt[2] + popt[3])  # Approximate error on normalized B2
                 bad_fit_checks = abs(popt / errs) < 3
-                # Allow for one of the side peaks to be poorly fit if consistent with zero
-                if abs(B1_fit) < 0.03 and bad_fit_checks[2]:
+                # Allow for the left side peak to be poorly fit, as is the case for single-sided RTN.
+                # Identify this if B1_fit is small, or if the left peak is outside of the bins.
+                if bad_fit_checks[2] and (abs(B1_fit) < 0.030 or mu_fit - d_fit < bins_min):
                     bad_fit_checks[2] = False
-                    single_sided = True
-                elif abs(B2_fit) < 0.03 and bad_fit_checks[3]:
-                    bad_fit_checks[3] = False
                     single_sided = True
                 else:
                     single_sided = False
-                if np.any(bad_fit_checks) or B1_fit > A_fit or B2_fit > A_fit:
+                if d_fit <= 3.0 * sigma_fit:
+                    too_close_count += 1
+                elif A_fit > 0.97:
+                    too_rare_count += 1
+                elif np.any(bad_fit_checks) or B1_fit > A_fit or B2_fit > A_fit:
                     # if (np.std(pixel_data) * adu_unit).to(u.electron).value > 0.4:
                     #     x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
                     #     y_fit = rtn_triple_gaussian(x_fit, *popt)
@@ -241,22 +243,21 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                     #     plt.xlabel("Pixel Value (ADU)")
                     #     plt.ylabel("Density")
                     #     print('not fit success')
-                    #     # print(B1_fit, B1_err, B2_fit, B2_err, bad_fit_checks)
+                    #     print(A_fit, A_err, B1_fit, B1_err, B2_fit, B2_err, bad_fit_checks)
                     #     print((sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
                     #     plt.show(block=True)
                     poor_fit_count += 1
-                elif A_fit > 0.95:
-                    too_rare_count += 1
-                elif (d_fit >= 3 * sigma_fit):
-                    # x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
-                    # y_fit = rtn_triple_gaussian(x_fit, *popt)
-                    # plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, bin_size), density=True, histtype='step', alpha=0.3, label='Pixel Data')
-                    # plt.plot(bin_centers, counts, 'kx', label='Binned Data')
-                    # plt.plot(x_fit, y_fit, 'r-', label='Fit')
-                    # plt.xlabel("Pixel Value (ADU)")
-                    # plt.ylabel("Density")
-                    # print((sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
-                    # plt.show(block=True)
+                else:
+                    if (np.std(pixel_data) * adu_unit).to(u.electron).value > 1:
+                        print((sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
+                        x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
+                        y_fit = rtn_triple_gaussian(x_fit, *popt)
+                        plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, bin_size), density=True, histtype='step', alpha=0.3, label='Pixel Data')
+                        plt.plot(bin_centers, counts, 'kx', label='Binned Data')
+                        plt.plot(x_fit, y_fit, 'r-', label='Fit')
+                        plt.xlabel("Pixel Value (ADU)")
+                        plt.ylabel("Density")
+                        plt.show(block=True)
                     # Convert to electrons if adu_unit is available, otherwise keep in ADU
                     if adu_unit is not None:
                         rtn_params_array[:-1, ix, iy] = [(mu_fit * adu_unit).to(u.electron).value,
@@ -269,8 +270,17 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                     rtn_count += 1
                     if single_sided:
                         single_sided_count += 1
-                else:
-                    too_close_count += 1
+                # if not rtn_mask[ix, iy] and (np.std(pixel_data) * adu_unit).to(u.electron).value > 5:
+                #     x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
+                #     y_fit = rtn_triple_gaussian(x_fit, *popt)
+                #     plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, bin_size), density=True, histtype='step', alpha=0.3, label='Pixel Data')
+                #     plt.plot(x_fit, y_fit, 'r-', label='Fit')
+                #     plt.xlabel("Pixel Value (ADU)")
+                #     plt.ylabel("Density")
+                #     print('not fit success')
+                #     print(A_fit, A_err, B1_fit, B1_err, B2_fit, B2_err, bad_fit_checks)
+                #     print((sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
+                #     plt.show(block=True) 
             except RuntimeError:
                 fit_fail_count += 1
                 continue
@@ -340,6 +350,7 @@ def get_snr_ratio(read_noise_arr, rtn_params_arr, plot=False, save_path=None):
 def get_new_read_noise(read_noise_arr, rtn_params_arr, plot=False, save_path=None):
     plt.rcParams.update({'font.size': 14})
     rtn_params_arr = np.nan_to_num(rtn_params_arr)
+    print(np.sum(rtn_params_arr[0] > 0), "RTN pixels identified")
     old_read_noise = np.sqrt(np.mean(read_noise_arr**2))
     flux_values = np.logspace(-3, 2, 30)
     # Add zero to flux values to show best-case read noise after correction
@@ -349,6 +360,7 @@ def get_new_read_noise(read_noise_arr, rtn_params_arr, plot=False, save_path=Non
     rtn_mask = rtn_params_arr[0] > 0
     for i, flux in enumerate(flux_values):
         correctable_mask = (rtn_params_arr[5] > flux) & rtn_mask
+        # print(np.sum(correctable_mask), f"pixels correctable at flux {flux:.4f} e-/pix/frame")
         # As an approximation, linearly interpolate from original read noise to sigma as lambda goes from 0 to lambda_max for each pixel
         eff_read_noise_arr = read_noise_arr.copy()
         eff_read_noise_arr[correctable_mask] = rtn_params_arr[4, correctable_mask] + (read_noise_arr[correctable_mask] - rtn_params_arr[4, correctable_mask]) * (flux / rtn_params_arr[5, correctable_mask])
@@ -357,6 +369,7 @@ def get_new_read_noise(read_noise_arr, rtn_params_arr, plot=False, save_path=Non
         new_read_noise_vals[i] = new_read_noise
         if i == 0:
             lowest_read_noise_arr = eff_read_noise_arr
+            print(np.mean(lowest_read_noise_arr[correctable_mask]), np.mean(read_noise_arr[correctable_mask]), "Mean read noise of correctable pixels at zero flux")
     if plot or save_path:
         # First plot histogram of best-case read noise at zero flux
         plt.figure()
@@ -524,6 +537,7 @@ def main():
 
     # Get sensor dimensions without loading data
     n_frames, (n_rows, n_cols), fits_files = get_bias_stack_info(args.bias_folder, frames_to_keep)
+    # n_rows = 50  # For debugging: limit to first 80 rows to speed up processing if needed
     if frames_to_keep is None or frames_to_keep > n_frames:
         frames_to_keep = n_frames
 
@@ -540,7 +554,7 @@ def main():
     print(f"Processing sensor in {n_slices} slice(s) of up to {slice_rows} rows each.")
 
     frames_for_stats = min(1000, frames_to_keep)
-    frames_for_nonnormal = min(400, frames_to_keep)
+    frames_for_nonnormal = min(1000, frames_to_keep)
 
     # Allocate full-sensor output arrays
     read_noise_array_full = np.zeros((n_rows, n_cols))
@@ -556,6 +570,8 @@ def main():
         print(f"  Slice {si+1}/{n_slices}: rows {r0}-{r1}")
         bias_slice = load_bias_stack_slice(args.bias_folder, r0, r1,
                                            frames_to_keep=frames_for_stats, fits_files=fits_files)
+        # For debugging: limit to first 80 columns to speed up processing if needed
+        # bias_slice = bias_slice[:,:80]
         if adu is not None:
             slice_data = bias_slice * adu
         else:
@@ -625,6 +641,8 @@ def main():
         print(f"  Slice {si+1}/{n_slices}: rows {r0}-{r1}")
         bias_slice = load_bias_stack_slice(args.bias_folder, r0, r1,
                                            frames_to_keep=frames_for_nonnormal, fits_files=fits_files)
+        # For debugging: limit to first 80 columns to speed up processing if needed
+        # bias_slice = bias_slice[:,:80]
         # Run AD test on this slice
         A2 = ad_statistics_normal(bias_slice)
         slice_read_noise = read_noise_array_with_units[r0:r1, :]
@@ -673,6 +691,8 @@ def main():
             continue
         bias_slice = load_bias_stack_slice(args.bias_folder, r0, r1,
                                            frames_to_keep=frames_to_keep, fits_files=fits_files)
+        # For debugging: limit to first 80 columns to speed up processing if needed
+        # bias_slice = bias_slice[:,:80]
         slice_nonnormal = nonnormal_mask_full[r0:r1, :]
         slice_params, slice_rtn_mask = fit_rtn_parameters(bias_slice, slice_nonnormal,
                                                           read_noise_stats, adu,

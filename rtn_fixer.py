@@ -379,7 +379,8 @@ def main():
     print(f"Done. Processed {n_frames} frames.")
     frac_high_corrections = num_corr_arr[1] / n_frames / (1 - rtn_params[1] - rtn_params[2])
     frac_low_corrections = num_corr_arr[0] / n_frames / rtn_params[2]
-    print(np.median(frac_high_corrections[rtn_mask]), np.median(frac_low_corrections[rtn_mask]))
+    # print(np.median(frac_high_corrections[rtn_mask]), np.median(frac_low_corrections[rtn_mask]))
+    print(np.nansum(num_corr_arr[1]), np.nansum(n_frames * (1 - rtn_params[1] - rtn_params[2])), np.nansum(num_corr_arr[0]), np.nansum(n_frames * rtn_params[2]))
     updated_bias_frame = old_mean_bias + np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
     correction_values = np.nan_to_num(rtn_params[3]) / e_per_adu * (num_corr_arr[0] - num_corr_arr[1]) / n_frames
     # new_mean_bias = (rtn_params[0] * (rtn_params[1] + frac_high_corrections * (1 - rtn_params[1] - rtn_params[2]) + frac_low_corrections * rtn_params[2]) +
