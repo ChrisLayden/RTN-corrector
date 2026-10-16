@@ -153,7 +153,11 @@ class ThresholdLUT:
     def load(filename):
         """Load LUT from disk"""
         with open(filename, 'rb') as f:
-            return pickle.load(f)
+            lut = pickle.load(f)
+        # Rebuild the interpolators from the stored tables rather than trusting the
+        # pickled scipy objects, whose internals change between scipy versions.
+        lut._build_interpolators()
+        return lut
 
 
 if __name__ == "__main__":
