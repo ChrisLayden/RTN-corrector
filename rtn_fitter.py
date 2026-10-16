@@ -11,8 +11,11 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 import copy
 import time
-import resource
 import os
+try:
+    import resource  # Unix only; used to raise the open-file limit
+except ImportError:  # Windows
+    resource = None
 from glob import glob
 from numba import njit
 from scripts.make_lut import ThresholdLUT
@@ -436,13 +439,18 @@ def get_bias_stack_info(fits_files, frames_to_keep=None):
 
 
 def get_reader(fits_files, nparallel):
-    # Try to ensure we can have enough open file handles
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    nfhandles = max(soft, nparallel * len(fits_files) + 10)
-    if hard < nfhandles:
-        hard = nfhandles
-    resource.setrlimit(resource.RLIMIT_NOFILE, (nfhandles, hard))
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    # Try to ensure we can have enough open file handles. The resource module
+    # is not available on Windows, and raising the limit may not be permitted,
+    # so treat this as best-effort.
+    if resource is not None:
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            nfhandles = max(soft, nparallel * len(fits_files) + 10)
+            if hard != resource.RLIM_INFINITY and hard < nfhandles:
+                hard = nfhandles
+            resource.setrlimit(resource.RLIMIT_NOFILE, (nfhandles, hard))
+        except (ValueError, OSError) as e:
+            print(f"Warning: could not raise open-file limit ({e}); continuing anyway.")
 
     ptsgen = FITSReader(fits_files)
     return ptsgen
@@ -468,7 +476,7 @@ def fit_slice(si, r0, r1, ptsgen, frames_to_keep, nonnormal_mask_full, read_nois
     bias_slice = np.array(bias_slice)
     slice_params, slice_rtn_mask = fit_rtn_parameters(bias_slice, slice_nonnormal,
                                                       read_noise_stats, adu,
-                                                      verbose=False)
+                                                      verbose=verbose)
     del bias_slice
     return si, slice_params
 
@@ -477,22 +485,25 @@ def fit_slice(si, r0, r1, ptsgen, frames_to_keep, nonnormal_mask_full, read_nois
 
 def main():
     parser = argparse.ArgumentParser(description='Identify and fit RTN parameters from bias frames (sliced mode).')
-    parser.add_argument('files', type=str, nargs='+', help='Folder containing bias FITS files')
+    parser.add_argument('files', type=str, nargs='+',
+                        help='Bias FITS files (2D frames and/or 3D data cubes). Shell globs work, e.g. /path/to/bias/*.fits')
     parser.add_argument('-g', '--gain', type=float, default=None, help='Gain in ADU/e- (optional; if not provided, analysis is done in ADU units, and results are not saved.)')
     parser.add_argument('-o', '--output', type=str, default=None,
-                        help='Output path for rtn_params.fits (default: ./rtn_fits_output/)')
+                        help='Output directory for rtn_params.fits and other outputs (default: ./rtn_fits_output/)')
     parser.add_argument('--frames', type=int, default=None,
                         help='Number of frames to use from bias stack (default: all available)')
-    parser.add_argument('--slice-rows', type=int, default=1,
-                        help='Number of rows per slice (default: 1).' 'Use this to limit RAM usage.')
-    parser.add_argument('-p', '--parallel', type=int, default=os.cpu_count(), help=f'Number of processors to use (default:{os.cpu_count()}).')
+    parser.add_argument('--slice-rows', type=int, default=10,
+                        help='Number of sensor rows loaded per slice (default: 10). Smaller values use less RAM; '
+                             'larger values reduce file I/O. There should be at least as many slices as processes '
+                             'for Pass 3 to run fully in parallel.')
+    parser.add_argument('-p', '--parallel', type=int, default=os.cpu_count(), help=f'Number of processes to use for fitting in Pass 3 (default: {os.cpu_count()}, all CPUs).')
     parser.add_argument('--lut', type=str, default=os.path.join(os.path.dirname(__file__), 'rts_threshold_lut.pkl'),
                         help='Path to threshold LUT file (default: [script_path]/rts_threshold_lut.pkl)')
     parser.add_argument('--plot', action='store_true',
                         help='Display plots (non-blocking) as the script runs')
     parser.add_argument('--save-plots', action='store_true',
                         help='Save plots to output folder')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output during fitting')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Print per-column progress during fitting (Pass 3)')
     args = parser.parse_args()
     if args.output is None:
         output_dir = os.path.realpath(os.path.join(os.getcwd(), 'rtn_fits_output'))
