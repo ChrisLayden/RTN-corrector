@@ -256,16 +256,16 @@ def fit_rtn_parameters(data, nonnormal_mask, read_noise_stats, adu_unit, verbose
                     #     plt.show(block=True)
                     poor_fit_count += 1
                 else:
-                    if (np.std(pixel_data) * adu_unit).to(u.electron).value > 1:
-                        print((sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
-                        x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
-                        y_fit = rtn_triple_gaussian(x_fit, *popt)
-                        plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, bin_size), density=True, histtype='step', alpha=0.3, label='Pixel Data')
-                        plt.plot(bin_centers, counts, 'kx', label='Binned Data')
-                        plt.plot(x_fit, y_fit, 'r-', label='Fit')
-                        plt.xlabel("Pixel Value (ADU)")
-                        plt.ylabel("Density")
-                        plt.show(block=True)
+                    # if (np.std(pixel_data) * adu_unit).to(u.electron).value > 1:
+                    #     print((sigma_fit * adu_unit).to(u.electron), (np.std(pixel_data) * adu_unit).to(u.electron))
+                    #     x_fit = np.linspace(bin_centers[0], bin_centers[-1], 1000)
+                    #     y_fit = rtn_triple_gaussian(x_fit, *popt)
+                    #     plt.hist(pixel_data, bins=np.arange(bins_min, bins_max + bin_size, bin_size), density=True, histtype='step', alpha=0.3, label='Pixel Data')
+                    #     plt.plot(bin_centers, counts, 'kx', label='Binned Data')
+                    #     plt.plot(x_fit, y_fit, 'r-', label='Fit')
+                    #     plt.xlabel("Pixel Value (ADU)")
+                    #     plt.ylabel("Density")
+                    #     plt.show(block=True)
                     # Convert to electrons if adu_unit is available, otherwise keep in ADU
                     if adu_unit is not None:
                         rtn_params_array[:-1, ix, iy] = [(mu_fit * adu_unit).to(u.electron).value,
